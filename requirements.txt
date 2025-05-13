@@ -1,0 +1,7 @@
+numpy
+opencv-python
+Pillow
+dearpygui
+matplotlib
+rawpy
+pyinstaller
