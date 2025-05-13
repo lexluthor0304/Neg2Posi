@@ -21,6 +21,9 @@ except ImportError:
 
 import os
 import dearpygui.dearpygui as dpg
+
+# Global flag tag for skip crop/rotate checkbox
+CHK_SKIP_CROP_ROTATE_TAG = "chk_skip_crop_rotate"
 import platform
 import matplotlib.font_manager as fm
 import time
@@ -345,6 +348,9 @@ def rotate_and_crop_color(img: np.ndarray) -> np.ndarray:
     """
     Robust color negative crop & rotate using iterative detection and rotation.
     """
+    # Skip all crop/rotate if user requested it via GUI
+    if dpg.is_dearpygui_running() and dpg.does_item_exist(CHK_SKIP_CROP_ROTATE_TAG) and dpg.get_value(CHK_SKIP_CROP_ROTATE_TAG):
+        return img
     LOWER_ORANGE = np.array([2,50,50])
     UPPER_ORANGE = np.array([30,255,255])
     pts = None
@@ -532,6 +538,13 @@ def _create_texture(img: np.ndarray, tag: str):
 # MODIFIED: _preview_images to use selected film_type
 def _preview_images(in_path: str, film_type: str):
     before = load_image(in_path)
+    # Downscale very large images for preview to reduce memory usage
+    max_preview_dim = 2048
+    h, w = before.shape[:2]
+    if max(h, w) > max_preview_dim:
+        scale = max_preview_dim / max(h, w)
+        # Use INTER_AREA for downsampling
+        before = cv2.resize(before, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     after = None # Initialize after
     
     override_pts = user_crops.get(in_path)
@@ -991,6 +1004,8 @@ def build_gui():
                 dpg.add_radio_button(items=film_type_radio_items, horizontal=True,
                                      tag="film_type_selector",
                                      default_value=film_type_radio_items[0])
+                # Checkbox to allow skipping crop and rotate
+                dpg.add_checkbox(label="Skip Crop & Rotate", tag=CHK_SKIP_CROP_ROTATE_TAG, default_value=False)
                 dpg.add_spacer(height=10)
                 # --- Banner ---
                 with dpg.collapsing_header(label="Quick Start Guide", default_open=False):
