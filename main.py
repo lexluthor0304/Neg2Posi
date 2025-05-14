@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import webbrowser
+import exifread
 # ------------------------------------------------------------------
 # macOS stability: disable OpenCL/Metal backend & limit OpenCV threads
 # ------------------------------------------------------------------
@@ -19,7 +20,98 @@ try:
 except ImportError:
     RAW_SUPPORTED = False
 
+# Flat-field correction using RAW metadata shading map
+def apply_raw_flat_field(path: str, img: np.ndarray) -> np.ndarray:
+    """
+    Apply flat-field correction using RAW metadata shading map if available.
+    """
+    try:
+        raw = rawpy.imread(str(path))
+        # shading_table returns a small calibration map per channel
+        shading = raw.shading_table()  # shape: (Hs, Ws, 4) in RGGB pattern
+        # Merge RGGB channels into 3-channel multiplier map:
+        # Interpolate shading map to image size
+        h, w = img.shape[:2]
+        # Convert 4-channel table to 3-channel: average appropriate channels
+        # For simplicity, average RGRG for red, GBGB for green, BRBR for blue
+        red_sh = (shading[:,:,0] + shading[:,:,2]) * 0.5
+        green_sh = (shading[:,:,1] + shading[:,:,3]) * 0.5
+        blue_sh = (shading[:,:,1] + shading[:,:,3]) * 0.5
+        sh_map = np.stack([
+            cv2.resize(red_sh,   (w,h), interpolation=cv2.INTER_LINEAR),
+            cv2.resize(green_sh, (w,h), interpolation=cv2.INTER_LINEAR),
+            cv2.resize(blue_sh,  (w,h), interpolation=cv2.INTER_LINEAR),
+        ], axis=2)
+        # Normalize map to mean=1
+        sh_map /= np.mean(sh_map, axis=(0,1), keepdims=True) + 1e-8
+        return np.clip(img / (sh_map + 1e-8), 0.0, 1.0)
+    except Exception:
+        # If raw shading not available, return original
+        return img
+
 import os
+import lensfunpy
+
+def apply_lensfun_correction(path: str, img: np.ndarray) -> np.ndarray:
+    """
+    Apply lens shading (vignetting) and distortion correction using lensfunpy.
+    """
+    # Read EXIF metadata via exifread for lensfun
+    camera_maker = camera_model = lens_model = ""
+    focal_length = aperture = 0.0
+    distance = 0.0  # assume infinity
+    try:
+        with open(path, 'rb') as f:
+            tags = exifread.process_file(f, details=False)
+        camera_maker = str(tags.get('Image Make', "")) 
+        camera_model = str(tags.get('Image Model', ""))
+        lens_model = str(tags.get('EXIF LensModel', "")) or str(tags.get('Image LensModel', ""))
+        # FocalLength tag
+        fl_tag = tags.get('EXIF FocalLength')
+        if hasattr(fl_tag, 'values') and len(fl_tag.values) == 1:
+            num, den = fl_tag.values[0].num, fl_tag.values[0].den
+            if den:
+                focal_length = num / den
+        # FNumber tag
+        fn_tag = tags.get('EXIF FNumber')
+        if hasattr(fn_tag, 'values') and len(fn_tag.values) == 1:
+            num, den = fn_tag.values[0].num, fn_tag.values[0].den
+            if den:
+                aperture = num / den
+    except Exception as e_exif:
+        logging.warning(f"EXIF read failed for lensfun metadata: {e_exif}")
+    logging.info(f"EXIF metadata: Make='{camera_maker}', Model='{camera_model}', Lens='{lens_model}', FocalLength={focal_length}, FNumber={aperture}")
+    # Initialize the lensfun database and lookup camera & lens
+    db = lensfunpy.Database()
+    cams = db.find_cameras(camera_maker, camera_model)
+    if not cams:
+        logging.warning(f"No lensfun camera profile found for {camera_maker} {camera_model}")
+        return img
+    cam = cams[0]
+    # Search by maker and lens name explicitly
+    lenses = db.find_lenses(cam, maker=camera_maker, lens=lens_model, loose_search=False)
+    if not lenses:
+        # Fallback: list all lenses for this camera maker
+        all_lenses = db.find_lenses(cam, maker=camera_maker)
+        matched = [l for l in all_lenses if lens_model.lower() in getattr(l, 'model', '').lower()]
+        if matched:
+            lens = matched[0]
+            logging.info(f"Using fallback lensfun profile model '{lens.model}' for EXIF lens '{lens_model}'")
+        else:
+            available = [getattr(l, 'model', '') for l in all_lenses]
+            logging.warning(f"No lensfun lens profile found for '{lens_model}'. Available models: {available}")
+            return img
+    else:
+        lens = lenses[0]
+    corrector = lensfunpy.Corrector(db, cam, lens, focal_length, aperture, distance)
+    # lensfun expects a byte image in linear space; convert float [0,1] to uint16
+    h, w = img.shape[:2]
+    img_u16 = (np.clip(img, 0.0, 1.0) * 65535.0).astype(np.uint16)
+    # Apply color (vignetting) correction
+    img_shaded = corrector.apply_color(img_u16)
+    # Convert back to float32 [0,1]
+    img_corr = img_shaded.astype(np.float32) / 65535.0
+    return img_corr
 import dearpygui.dearpygui as dpg
 
 # Global flag tag for skip crop/rotate checkbox
@@ -83,10 +175,13 @@ FILM_TYPE_COLOR_INTERNAL_KEY = "color"
 FILM_TYPE_BW_INTERNAL_KEY = "bw"
 
 
+
 # Global storage for manual crop overrides
 user_crops = {}
 # Global storage for manual rotation overrides (degrees)
 user_angles = {}
+# Global storage for current crop editor context
+crop_editor_active_context = {}
 
 
 # Globals for current crop editor context
@@ -129,7 +224,13 @@ def save_image(rgb, path):
     png_path = path_obj.with_suffix(".png")
     success = cv2.imwrite(str(png_path), bgr)
     if not success:
-        raise IOError(f"Failed to write image PNG to {png_path}.")
+        logging.warning(f"cv2.imwrite failed for {png_path}, attempting PIL fallback.")
+        try:
+            from PIL import Image as PILImage
+            PILImage.fromarray(bgr).save(str(png_path))
+            logging.info(f"PIL fallback save succeeded: {png_path}")
+        except Exception as e_fallback:
+            raise IOError(f"Failed to write image PNG to {png_path} via cv2 and PIL fallback: {e_fallback}")
     logging.info(f"Saved: {png_path}")
 
 
@@ -316,6 +417,65 @@ def detect_film_region_color(img, lower_hsv, upper_hsv):
     pts = order_points(pts)
     return pts if _is_valid_region(pts, img.shape) else None
 
+
+# Helper function for initial crop/angle settings
+def _determine_initial_crop_settings(path: str, film_type_key: str, original_img: np.ndarray, user_crop_pts=None, user_angle: float = 0.0):
+    """
+    Determine initial crop margins and angle based on user overrides or auto-detection.
+    Returns (settings_dict, detected_pts).
+    """
+    # If user override exists, use it
+    if user_crop_pts and isinstance(user_crop_pts, (list, tuple)) and len(user_crop_pts) == 4:
+        pts = order_points(np.array(user_crop_pts, dtype=np.float32))
+        # Compute margins relative to original image dimensions
+        h, w = original_img.shape[:2]
+        tl, tr, br, bl = pts
+        left = int(max(0.0, tl[0]))
+        top = int(max(0.0, tl[1]))
+        right = int(max(0.0, w - 1 - tr[0]))
+        bottom = int(max(0.0, h - 1 - bl[1]))
+        return ({"left": left, "right": right, "top": top, "bottom": bottom, "angle": user_angle}, pts)
+
+    # No user override: attempt auto-detection
+    pts = None
+    if film_type_key == FILM_TYPE_BW_INTERNAL_KEY:
+        detectors = (detect_film_region_proj, detect_film_region_refined, detect_film_region_bw, detect_film_region_hough, detect_film_region_simple)
+    else:
+        LOWER_ORANGE = np.array([2,50,50]); UPPER_ORANGE = np.array([30,255,255])
+        detectors = (
+            lambda im: detect_film_region_color(im, LOWER_ORANGE, UPPER_ORANGE),
+            detect_film_region_hough,
+            detect_film_region_proj,
+            detect_film_region_refined,
+            detect_film_region_simple
+        )
+    for det in detectors:
+        if pts is None:
+            pts = det(original_img)
+
+    # Fallback to full image if no region detected
+    if pts is None:
+        h, w = original_img.shape[:2]
+        pts = np.array([[0,0], [w-1,0], [w-1,h-1], [0,h-1]], dtype=np.float32)
+        angle = 0.0
+    else:
+        # Estimate rotation angle from top edge
+        tl, tr, _, _ = order_points(pts)
+        angle = float(np.degrees(np.arctan2(tr[1] - tl[1], tr[0] - tl[0])))
+        # Zero small angles
+        if abs(angle) < 1.0:
+            angle = 0.0
+
+    # Compute margins based on pts
+    pts = order_points(pts)
+    tl, tr, br, bl = pts
+    h, w = original_img.shape[:2]
+    left = int(max(0.0, tl[0]))
+    top = int(max(0.0, tl[1]))
+    right = int(max(0.0, w - 1 - tr[0]))
+    bottom = int(max(0.0, h - 1 - bl[1]))
+    return ({"left": left, "right": right, "top": top, "bottom": bottom, "angle": angle}, pts)
+
 def crop_and_warp(img, src_pts):
     if src_pts is None or len(src_pts) != 4 : return img # Return original if no valid points
     tl, tr, br, bl = src_pts
@@ -450,6 +610,16 @@ def process_color_pipeline(img: np.ndarray, low_pct: float, high_pct: float) -> 
 # MODIFIED: rt_auto_cast_removal to accept film_type
 def rt_auto_cast_removal(in_path, out_path, film_type: str, low_pct=0.5, high_pct=99.5, override_pts=None):
     img = load_image(in_path)
+
+    # If RAW and shading metadata available, apply flat-field correction
+    if RAW_SUPPORTED and Path(in_path).suffix.lower() in ('.dng', '.cr2', '.nef', '.arw', '.raf'):
+        img = apply_raw_flat_field(in_path, img)
+
+    # Lensfun automatic flat-field (vignetting & distortion) correction
+    try:
+        img = apply_lensfun_correction(in_path, img)
+    except Exception as e_lf:
+        logging.warning(f"Lensfun correction failed: {e_lf}")
     
     # User-defined crop takes precedence over auto-detection within pipelines
     if override_pts is not None and len(override_pts) == 4:
@@ -538,13 +708,6 @@ def _create_texture(img: np.ndarray, tag: str):
 # MODIFIED: _preview_images to use selected film_type
 def _preview_images(in_path: str, film_type: str):
     before = load_image(in_path)
-    # Downscale very large images for preview to reduce memory usage
-    max_preview_dim = 2048
-    h, w = before.shape[:2]
-    if max(h, w) > max_preview_dim:
-        scale = max_preview_dim / max(h, w)
-        # Use INTER_AREA for downsampling
-        before = cv2.resize(before, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     after = None # Initialize after
     
     override_pts = user_crops.get(in_path)
@@ -653,114 +816,93 @@ def _update_crop_preview(sender, app_data):
              dpg.add_image(tex, width=w_after, height=h_after, tag=f"img_display_after_{editing_idx}", parent=f"after_view_container_{editing_idx}")
 
 
-def _open_crop_editor(sender, app_data, user_data):
+
+def _open_crop_editor(sender, app_data, user_data_tuple: tuple[str, int, str]) -> None:
+    # user_data_tuple is (path, idx, current_texture_tag_for_after_image)
+    path, idx, current_texture_tag_after = user_data_tuple
     global editing_path, editing_idx
-    path, idx = user_data
     editing_path = path
     editing_idx = idx
+
+    # Store essential context for the modal's callbacks
+    # Item 5: Load original image ONCE here
+    try:
+        original_img_loaded = load_image(path)
+    except Exception as e:
+        logging.error(f"Cannot open crop editor: Failed to load image {path}: {e}")
+        dpg.set_value("status_text", f"Error: Could not load {Path(path).name} for cropping.")
+        return
+
+    # Update global-like context (this should ideally be encapsulated if app grows)
+    crop_editor_active_context.update({
+        "path": path,
+        "idx": idx,
+        "original_image_for_crop": original_img_loaded,
+        "current_texture_tag_after": current_texture_tag_after
+    })
+
     selected_film_type_key = get_selected_film_type_key_from_gui()
-    pts_to_edit = user_crops.get(path, None)
-    initial_angle = user_angles.get(path, 0.0)
-    img_for_detection = load_image(path)
-    h_img, w_img = img_for_detection.shape[:2]
-    if pts_to_edit is None:
-        temp_img_rotated_for_detection = img_for_detection
-        detected_pts = None
-        LOWER_ORANGE = np.array([2,50,50])
-        UPPER_ORANGE = np.array([30,255,255])
-        if selected_film_type_key == FILM_TYPE_BW_INTERNAL_KEY:
-            dets = (detect_film_region_proj, detect_film_region_refined, detect_film_region_bw, detect_film_region_hough, detect_film_region_simple)
-        else:
-            dets = (lambda im: detect_film_region_color(im, LOWER_ORANGE, UPPER_ORANGE), detect_film_region_hough, detect_film_region_proj, detect_film_region_refined, detect_film_region_simple)
-        for det_func in dets:
-            if detected_pts is None:
-                detected_pts = det_func(temp_img_rotated_for_detection)
-        if detected_pts is not None:
-            tl_det, tr_det, br_det, bl_det = detected_pts
-            h_det_img, w_det_img = temp_img_rotated_for_detection.shape[:2]
-            init_left = int(max(0.0, tl_det[0]))
-            init_top = int(max(0.0, tl_det[1]))
-            init_right = int(max(0.0, w_det_img - tr_det[0]))
-            init_bottom = int(max(0.0, h_det_img - bl_det[1]))
-            user_crops[path] = [(float(x), float(y)) for x,y in detected_pts]
-            pts_to_edit = user_crops[path]
-        else:
-            logging.warning(f"No crop region auto-detected for: {Path(path).name}. Using full image.")
-            init_left, init_top, init_right, init_bottom = 0,0,0,0
-            pts_to_edit = [(0.0,0.0), (float(w_img-1), 0.0), (float(w_img-1), float(h_img-1)), (0.0, float(h_img-1))]
-            user_crops[path] = pts_to_edit
-    current_tl, current_tr, _, current_bl = order_points(np.array(pts_to_edit, dtype=np.float32))
-    init_left   = int(max(0.0, current_tl[0]))
-    init_top    = int(max(0.0, current_tl[1]))
-    init_right  = int(max(0.0, w_img - 1 - current_tr[0]))
-    init_bottom = int(max(0.0, h_img - 1 - current_bl[1]))
-    if dpg.does_item_exist("CropEditor"): dpg.delete_item("CropEditor")
-    with dpg.window(label=UI_TEXT["crop_editor_title"], tag="CropEditor", width=400, height=350, pos=[dpg.get_viewport_width() // 2 - 200, dpg.get_viewport_height() // 2 - 175]):
-        with dpg.child_window(tag="CropEditorBody", autosize_x=True, border=False):
-            dpg.add_text(UI_TEXT["crop_editor_adjust_for"].format(Path(path).name))
-            dpg.add_text("Note: 'Top' = upper edge, 'Bottom' = lower edge, 'Left' = left edge, 'Right' = right edge.", wrap=350)
-            # Orientation guide diagram
-            dpg.add_text("Orientation Guide:", wrap=350)
-            with dpg.drawlist(width=250, height=150):
-                # Outer rectangle
-                dpg.draw_rectangle((10, 10), (240, 140))
-                # Side labels
-                dpg.draw_text((120, 12), "Top")
-                dpg.draw_text((120, 130), "Bottom")
-                dpg.draw_text((12, 75), "Left")
-                dpg.draw_text((200, 75), "Right")
-            dpg.add_input_int(
-                label=UI_TEXT["crop_margin_left"],
-                default_value=init_left,
-                tag="crop_left",
-                callback=_update_crop_preview,
-                min_value=0, step=1, width=-1
-            )
-            dpg.add_input_int(
-                label=UI_TEXT["crop_margin_right"],
-                default_value=init_right,
-                tag="crop_right",
-                callback=_update_crop_preview,
-                min_value=0, step=1, width=-1
-            )
-            dpg.add_input_int(
-                label=UI_TEXT["crop_margin_top"],
-                default_value=init_top,
-                tag="crop_top",
-                callback=_update_crop_preview,
-                min_value=0, step=1, width=-1
-            )
-            dpg.add_input_int(
-                label=UI_TEXT["crop_margin_bottom"],
-                default_value=init_bottom,
-                tag="crop_bottom",
-                callback=_update_crop_preview,
-                min_value=0, step=1, width=-1
-            )
-            dpg.add_input_float(
-                label=UI_TEXT["crop_rotation_angle"],
-                default_value=initial_angle,
-                tag="crop_angle",
-                callback=_update_crop_preview,
-                step=0.5, format="%.1f deg", width=-1
-            )
-            dpg.add_spacer(height=10)
-            dpg.add_button(
-                label=UI_TEXT["apply_crop_button"],
-                callback=_apply_crop_editor,
-                width=-1, height=30
-            )
+
+    # Get existing user crop/angle or auto-detect
+    # This helper function now encapsulates the detection/fallback logic
+    initial_gui_settings, _ = _determine_initial_crop_settings(
+        path,
+        selected_film_type_key,
+        original_img_loaded, # Pass loaded image for detection
+        user_crops.get(path),
+        user_angles.get(path, 0.0)
+    )
+
+    # Delete existing editor if any
+    if dpg.does_item_exist("CropEditorWindow"):
+        dpg.delete_item("CropEditorWindow")
+
+    # Data for callbacks within the crop editor modal
+    # This context is passed to input callbacks and the apply button
+    callback_user_data = crop_editor_active_context
+
+    with dpg.window(label=UI_TEXT["crop_editor_title"], tag="CropEditorWindow",
+                    width=450, height=450, modal=True,
+                    pos=[dpg.get_viewport_width() // 2 - 225, dpg.get_viewport_height() // 2 - 225],
+                    on_close=lambda: crop_editor_active_context.update({"path":None, "idx":None, "original_image_for_crop":None, "current_texture_tag_after":None})): # Clear context on close
+
+        dpg.add_text(UI_TEXT["crop_editor_adjust_for"].format(Path(path).name))
+        dpg.add_spacer(height=5)
+        # Input fields for margins and angle
+        # Important: Tags for input fields are now unique (e.g. "crop_left_input") to avoid conflict
+        # User data for these input callbacks is `callback_user_data`
+        dpg.add_input_int(label=UI_TEXT["crop_margin_left"], tag="crop_left_input",
+                          default_value=initial_gui_settings["left"], min_value=0, step=1, width=200,
+                          callback=_update_crop_preview, user_data=callback_user_data)
+        dpg.add_input_int(label=UI_TEXT["crop_margin_right"], tag="crop_right_input",
+                          default_value=initial_gui_settings["right"], min_value=0, step=1, width=200,
+                          callback=_update_crop_preview, user_data=callback_user_data)
+        dpg.add_input_int(label=UI_TEXT["crop_margin_top"], tag="crop_top_input",
+                          default_value=initial_gui_settings["top"], min_value=0, step=1, width=200,
+                          callback=_update_crop_preview, user_data=callback_user_data)
+        dpg.add_input_int(label=UI_TEXT["crop_margin_bottom"], tag="crop_bottom_input",
+                          default_value=initial_gui_settings["bottom"], min_value=0, step=1, width=200,
+                          callback=_update_crop_preview, user_data=callback_user_data)
+        dpg.add_input_float(label=UI_TEXT["crop_rotation_angle"], tag="crop_angle_input",
+                            default_value=initial_gui_settings["angle"], step=0.1, format="%.1f deg", width=200, # Smaller step for finer control
+                            callback=_update_crop_preview, user_data=callback_user_data)
+        dpg.add_separator()
+        dpg.add_button(label=UI_TEXT["apply_crop_button"], tag="crop_apply_button",
+                       width=-1, height=30,
+                       callback=_apply_crop_editor, user_data=callback_user_data)
+
+        # Trigger initial preview update when editor opens
         _update_crop_preview(None, None)
 
 
-def _apply_crop_editor(sender, app_data):
+def _apply_crop_editor(sender, app_data, user_data=None):
     global editing_path, editing_idx
     img_original_geom = load_image(editing_path)
     h_img, w_img = img_original_geom.shape[:2]
-    margin_left   = dpg.get_value("crop_left")
-    margin_right  = dpg.get_value("crop_right")
-    margin_top    = dpg.get_value("crop_top")
-    margin_bottom = dpg.get_value("crop_bottom")
+    margin_left   = dpg.get_value("crop_left_input")
+    margin_right  = dpg.get_value("crop_right_input")
+    margin_top    = dpg.get_value("crop_top_input")
+    margin_bottom = dpg.get_value("crop_bottom_input")
     # Ensure margin values are not None to avoid TypeError
     if margin_left is None:
         margin_left = 0
@@ -776,7 +918,9 @@ def _apply_crop_editor(sender, app_data):
     bl = (float(margin_left), float(h_img - 1 - margin_bottom))
     new_pts_ordered = order_points(np.array([tl, tr, br, bl], dtype=np.float32))
     user_crops[editing_path] = [(x,y) for x,y in new_pts_ordered]
-    angle = dpg.get_value("crop_angle")
+    angle = dpg.get_value("crop_angle_input")
+    if angle is None:
+        angle = 0.0
     user_angles[editing_path] = float(angle)
     selected_film_type_key = get_selected_film_type_key_from_gui()
     before_img, after_img = _preview_images(editing_path, selected_film_type_key)
@@ -794,8 +938,8 @@ def _apply_crop_editor(sender, app_data):
         dpg.configure_item(img_display_tag, texture_tag=new_tex, width=img_w_preview, height=img_h_preview)
     elif dpg.does_item_exist(after_view_container_tag):
         dpg.add_image(new_tex, tag=img_display_tag, parent=after_view_container_tag, width=img_w_preview, height=img_h_preview)
-    if dpg.does_item_exist("CropEditor"):
-        dpg.delete_item("CropEditor")
+    if dpg.does_item_exist("CropEditorWindow"):
+        dpg.delete_item("CropEditorWindow")
 
 
 # MODIFIED: _process_path to accept and use film_type
@@ -951,7 +1095,7 @@ def build_gui():
                     with dpg.child_window(width=panel_w, height=max(before_h, after_h) + 60, tag=after_container_tag, border=False):
                         dpg.add_text("After")
                         dpg.add_image(after_tex_tag, tag=f"img_display_after_{i}", width=panel_w, height=after_h)
-                        dpg.add_button(label=UI_TEXT["edit_crop_button"], callback=_open_crop_editor, user_data=(pth_str, i))
+                        dpg.add_button(label=UI_TEXT["edit_crop_button"], callback=_open_crop_editor, user_data=(pth_str, i, after_tex_tag))
             except Exception as e_preview:
                 logging.error(f"Error previewing {pth_str}: {e_preview}")
                 dpg.add_text(f"Error previewing {Path(pth_str).name}: {e_preview}", parent="preview_area_content", color=[255,0,0])
