@@ -13,12 +13,14 @@ from PySide6 import QtCore, QtGui, QtWidgets
 @dataclass
 class ProcessingAPI:
     preview_images: Callable[[str, str], Tuple[np.ndarray, np.ndarray]]
+    preview_cached_after: Callable[[str, str], np.ndarray]
     process_path: Callable[[str, str, str, bool], None]
     set_adjustments: Callable[[float, float, float, float], None]
     get_adjustments: Callable[[], Tuple[float, float, float, float]]
     set_manual_crop_points: Callable[[str, Iterable[Tuple[float, float]], float], None]
     get_manual_crop_points: Callable[[str], Optional[List[Tuple[float, float]]]]
     clear_manual_crop: Callable[[str], None]
+    clear_preview_cache: Callable[[], None]
     allowed_extensions: Tuple[str, ...]
 
 
@@ -681,13 +683,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.current_preview_path is None:
             return
         try:
-            before, after = self.api.preview_images(self.current_preview_path, self._selected_film_type())
+            after = self.api.preview_cached_after(
+                self.current_preview_path,
+                self._selected_film_type(),
+            )
         except Exception as exc:  # noqa: BLE001
             self.status_label.setText(
                 self._t("status_preview_failed", "Preview failed: {}" ).format(exc)
             )
             return
-        self._update_preview(before, after)
+        self.last_after_image = after
+        self._refresh_after_label()
 
     def _reset_adjustments(self) -> None:
         self._adjustment_sync_in_progress = True
@@ -746,6 +752,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def run_qt_app(api: ProcessingAPI) -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.aboutToQuit.connect(api.clear_preview_cache)  # type: ignore[arg-type]
     window = MainWindow(api)
     window.resize(1200, 700)
     window.show()

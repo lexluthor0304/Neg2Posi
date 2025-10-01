@@ -59,6 +59,7 @@ def apply_raw_flat_field(path: str, img: np.ndarray) -> np.ndarray:
 
 import os
 import lensfunpy
+import threading
 
 def apply_lensfun_correction(path: str, img: np.ndarray) -> np.ndarray:
     """
@@ -152,6 +153,18 @@ class AdjustmentState:
 _current_adjustments = AdjustmentState()
 
 
+@dataclass
+class PreviewCacheEntry:
+    key: tuple[str, str, str]
+    mtime: float
+    before: np.ndarray
+    intermediate: np.ndarray
+
+
+_preview_cache: dict[tuple[str, str, str], PreviewCacheEntry] = {}
+_preview_cache_lock = threading.Lock()
+
+
 def set_adjustments(brightness: float, cyan: float, magenta: float, yellow: float) -> None:
     """Update global tone adjustment settings."""
 
@@ -166,6 +179,97 @@ def get_adjustments() -> tuple[float, float, float, float]:
 
     adj = _current_adjustments
     return adj.brightness, adj.cyan, adj.magenta, adj.yellow
+
+
+def _preview_override_signature(
+    path: str | os.PathLike[str],
+    override_pts: Iterable[tuple[float, float]] | np.ndarray | None,
+) -> str:
+    pts = _prepare_override_points(override_pts)
+    if pts is None:
+        stored_pts = _lookup_override_points(path)
+        pts = _prepare_override_points(stored_pts)
+        if pts is None:
+            return "auto"
+    angle = _lookup_override_angle(path)
+    flattened = ",".join(f"{coord:.4f}" for coord in pts.flatten())
+    return f"manual:{flattened}|{angle:.4f}"
+
+
+def _preview_cache_key(
+    path: str | os.PathLike[str], film_type: str, override_signature: str
+) -> tuple[str, str, str]:
+    return _normalize_path_key(path), film_type, override_signature
+
+
+def _get_or_create_preview_entry(
+    in_path: str,
+    film_type: str,
+    override_pts: Iterable[tuple[float, float]] | np.ndarray | None = None,
+    preloaded_before: np.ndarray | None = None,
+    low_pct: float = 0.5,
+    high_pct: float = 99.5,
+) -> PreviewCacheEntry:
+    path_obj = Path(in_path)
+    mtime = path_obj.stat().st_mtime
+    override_signature = _preview_override_signature(in_path, override_pts)
+    cache_key = _preview_cache_key(in_path, film_type, override_signature)
+    with _preview_cache_lock:
+        entry = _preview_cache.get(cache_key)
+        if entry is not None and entry.mtime == mtime:
+            return entry
+    before = (
+        np.array(preloaded_before, dtype=np.float32, copy=False)
+        if preloaded_before is not None
+        else load_image(in_path)
+    )
+    core = _process_loaded_image_core(
+        before,
+        in_path,
+        film_type,
+        low_pct,
+        high_pct,
+        override_pts=override_pts,
+    )
+    entry = PreviewCacheEntry(cache_key, mtime, before, core)
+    with _preview_cache_lock:
+        _preview_cache[cache_key] = entry
+    return entry
+
+
+def _resolve_preview_entry(
+    in_path: str,
+    film_type: str,
+    override_pts: Iterable[tuple[float, float]] | np.ndarray | None = None,
+    preloaded_before: np.ndarray | None = None,
+    low_pct: float = 0.5,
+    high_pct: float = 99.5,
+) -> PreviewCacheEntry:
+    try:
+        return _get_or_create_preview_entry(
+            in_path,
+            film_type,
+            override_pts=override_pts,
+            preloaded_before=preloaded_before,
+            low_pct=low_pct,
+            high_pct=high_pct,
+        )
+    except FileNotFoundError:
+        _invalidate_preview_cache(in_path)
+        raise
+
+
+def _invalidate_preview_cache(path: str | os.PathLike[str]) -> None:
+    norm = _normalize_path_key(path)
+    with _preview_cache_lock:
+        keys_to_remove = [key for key in _preview_cache if key[0] == norm]
+        for key in keys_to_remove:
+            _preview_cache.pop(key, None)
+
+
+def _clear_preview_cache() -> None:
+    with _preview_cache_lock:
+        _preview_cache.clear()
 
 
 def set_manual_crop_points(
@@ -187,6 +291,7 @@ def clear_manual_crop(path: str | os.PathLike[str]) -> None:
     """Remove any stored manual crop/angle overrides for *path*."""
 
     norm_key = _normalize_path_key(path)
+    _invalidate_preview_cache(path)
     for key in list(user_crops.keys()):
         if _normalize_path_key(key) == norm_key:
             user_crops.pop(key, None)
@@ -261,6 +366,7 @@ def _store_user_override(
 ) -> None:
     """Persist manual crop *pts* and *angle* under raw and normalized keys."""
 
+    _invalidate_preview_cache(path)
     norm_key = _normalize_path_key(path)
     raw_key = str(path)
     keys_to_keep = {raw_key, norm_key}
@@ -445,7 +551,7 @@ def _apply_tone_adjustments(img: np.ndarray) -> np.ndarray:
     return np.clip(out, 0.0, 1.0)
 
 
-def _process_loaded_image(
+def _process_loaded_image_core(
     img_original: np.ndarray,
     in_path: str,
     film_type: str,
@@ -453,7 +559,7 @@ def _process_loaded_image(
     high_pct: float,
     override_pts: Iterable[tuple[float, float]] | np.ndarray | None = None,
 ) -> np.ndarray:
-    """Run the full processing pipeline starting from a preloaded image."""
+    """Run the heavy pipeline steps and return the image before tone tweaks."""
 
     img = np.array(img_original, dtype=np.float32, copy=True)
 
@@ -474,9 +580,28 @@ def _process_loaded_image(
     img_geom = _apply_geometry(img, film_type, pts_array, angle)
 
     if film_type == FILM_TYPE_BW_INTERNAL_KEY:
-        img_corr = process_bw_pipeline(img_geom, low_pct, high_pct, apply_geometry=False)
-    else:
-        img_corr = process_color_pipeline(img_geom, low_pct, high_pct, apply_geometry=False)
+        return process_bw_pipeline(img_geom, low_pct, high_pct, apply_geometry=False)
+    return process_color_pipeline(img_geom, low_pct, high_pct, apply_geometry=False)
+
+
+def _process_loaded_image(
+    img_original: np.ndarray,
+    in_path: str,
+    film_type: str,
+    low_pct: float,
+    high_pct: float,
+    override_pts: Iterable[tuple[float, float]] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Run the full processing pipeline starting from a preloaded image."""
+
+    img_corr = _process_loaded_image_core(
+        img_original,
+        in_path,
+        film_type,
+        low_pct,
+        high_pct,
+        override_pts=override_pts,
+    )
     return _apply_tone_adjustments(img_corr)
 
 
@@ -892,17 +1017,30 @@ ALLOWED_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff',
                 '.dng', '.cr2', '.nef', '.arw', '.raf')
 
 def _preview_images(in_path: str, film_type: str):
-    before = load_image(in_path)
     override_pts = _lookup_override_points(in_path)
-    after = _process_loaded_image(
-        before,
+    entry = _resolve_preview_entry(
         in_path,
         film_type,
+        override_pts=override_pts,
         low_pct=0.5,
         high_pct=99.5,
-        override_pts=override_pts,
     )
-    return before, after
+    after = _apply_tone_adjustments(entry.intermediate)
+    return entry.before, after
+
+
+def _preview_cached_after(in_path: str, film_type: str) -> np.ndarray:
+    """Return a tone-adjusted preview using a cached intermediate when available."""
+
+    override_pts = _lookup_override_points(in_path)
+    entry = _resolve_preview_entry(
+        in_path,
+        film_type,
+        override_pts=override_pts,
+        low_pct=0.5,
+        high_pct=99.5,
+    )
+    return _apply_tone_adjustments(entry.intermediate)
 
 
 def _apply_crop_editor(
@@ -937,7 +1075,16 @@ def _apply_crop_editor(
     pts_for_storage = [(float(x), float(y)) for x, y in new_pts_ordered]
     _store_user_override(path, pts_for_storage, angle)
 
-    return _preview_images(path, film_type)
+    entry = _resolve_preview_entry(
+        path,
+        film_type,
+        override_pts=new_pts_ordered,
+        preloaded_before=img_original,
+        low_pct=0.5,
+        high_pct=99.5,
+    )
+    after = _apply_tone_adjustments(entry.intermediate)
+    return entry.before, after
 
 
 def get_manual_crop_settings(path: str) -> tuple[dict[str, float], float]:
@@ -1000,12 +1147,14 @@ def launch_qt_ui() -> None:
 
     api = ProcessingAPI(
         preview_images=_preview_images,
+        preview_cached_after=_preview_cached_after,
         process_path=_process_path,
         set_adjustments=set_adjustments,
         get_adjustments=get_adjustments,
         set_manual_crop_points=set_manual_crop_points,
         get_manual_crop_points=get_manual_crop_points,
         clear_manual_crop=clear_manual_crop,
+        clear_preview_cache=_clear_preview_cache,
         allowed_extensions=ALLOWED_EXTS,
     )
     run_qt_app(api)
