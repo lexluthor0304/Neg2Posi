@@ -19,6 +19,7 @@ class ProcessingAPI:
     set_manual_crop_points: Callable[[str, Iterable[Tuple[float, float]], float], None]
     get_manual_crop_points: Callable[[str], Optional[List[Tuple[float, float]]]]
     clear_manual_crop: Callable[[str], None]
+    clear_preview_cache: Callable[[], None]
     allowed_extensions: Tuple[str, ...]
 
 
@@ -746,6 +747,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def run_qt_app(api: ProcessingAPI) -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.aboutToQuit.connect(api.clear_preview_cache)  # type: ignore[arg-type]
     window = MainWindow(api)
     window.resize(1200, 700)
     window.show()
