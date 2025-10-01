@@ -153,24 +153,32 @@ def load_image(path):
         return arr
 
 def save_image(rgb, path):
-    out = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
-    if out.ndim == 2:
-        bgr = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+    rgb_clipped = np.clip(rgb, 0.0, 1.0)
+    out_16 = (rgb_clipped * 65535.0 + 0.5).astype(np.uint16)
+    if out_16.ndim == 2:
+        bgr = cv2.cvtColor(out_16, cv2.COLOR_GRAY2BGR)
     else:
-        bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+        bgr = cv2.cvtColor(out_16, cv2.COLOR_RGB2BGR)
     path_obj = Path(path)
     path_obj.parent.mkdir(parents=True, exist_ok=True)
     png_path = path_obj.with_suffix(".png")
-    success = cv2.imwrite(str(png_path), bgr)
+    params = [cv2.IMWRITE_PNG_COMPRESSION, 1]
+    success = cv2.imwrite(str(png_path), bgr, params)
     if not success:
-        logging.warning(f"cv2.imwrite failed for {png_path}, attempting PIL fallback.")
+        logging.warning(f"cv2.imwrite failed for {png_path}, attempting PIL fallback (8-bit conversion).")
         try:
             from PIL import Image as PILImage
-            PILImage.fromarray(bgr).save(str(png_path))
+            fallback_rgb = (rgb_clipped * 255.0 + 0.5).astype(np.uint8)
+            if fallback_rgb.ndim == 2:
+                PILImage.fromarray(fallback_rgb, mode="L").save(str(png_path))
+            else:
+                PILImage.fromarray(fallback_rgb, mode="RGB").save(str(png_path))
             logging.info(f"PIL fallback save succeeded: {png_path}")
         except Exception as e_fallback:
-            raise IOError(f"Failed to write image PNG to {png_path} via cv2 and PIL fallback: {e_fallback}")
-    logging.info(f"Saved: {png_path}")
+            raise IOError(
+                f"Failed to write image PNG to {png_path} via cv2 and PIL fallback: {e_fallback}"
+            ) from e_fallback
+    logging.info(f"Saved 16-bit PNG: {png_path}")
 
 
 def order_points(pts):
