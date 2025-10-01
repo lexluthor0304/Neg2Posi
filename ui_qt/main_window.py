@@ -118,6 +118,235 @@ class CropDialog(QtWidgets.QDialog):
         }, float(self.angle_spin.value())
 
 
+class CropPreview(QtWidgets.QFrame):
+    cropChanged = QtCore.Signal(QtCore.QRectF)
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFrameShape(QtWidgets.QFrame.Box)
+        self.setLineWidth(1)
+        self.setMinimumSize(200, 200)
+        self.setCursor(QtCore.Qt.CrossCursor)
+        self._pixmap = QtGui.QPixmap()
+        self._scaled_pixmap = QtGui.QPixmap()
+        self._image_size = QtCore.QSize()
+        self._offset = QtCore.QPointF(0.0, 0.0)
+        self._scale = 1.0
+        self._crop_rect = QtCore.QRectF()
+        self._dragging = False
+        self._drag_start = QtCore.QPointF()
+        self._drag_current = QtCore.QPointF()
+        self._drag_rect_widget = QtCore.QRectF()
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: D401, N802
+        return QtCore.QSize(320, 320)
+
+    def clear(self) -> None:
+        self._pixmap = QtGui.QPixmap()
+        self._scaled_pixmap = QtGui.QPixmap()
+        self._image_size = QtCore.QSize()
+        self._crop_rect = QtCore.QRectF()
+        self.update()
+
+    def set_image(
+        self,
+        arr: Optional[np.ndarray],
+        crop_rect: Optional[QtCore.QRectF] = None,
+    ) -> None:
+        if arr is None:
+            self.clear()
+            return
+        self._pixmap = numpy_to_qpixmap(arr)
+        self._image_size = QtCore.QSize(self._pixmap.width(), self._pixmap.height())
+        self._update_scaled_pixmap()
+        if crop_rect is None or crop_rect.isNull():
+            self._crop_rect = self._full_image_rect()
+        else:
+            self._crop_rect = self._clip_rect_to_image(crop_rect)
+        self.update()
+
+    def set_crop_rect(self, crop_rect: Optional[QtCore.QRectF]) -> None:
+        if self._image_size.isEmpty():
+            return
+        if crop_rect is None or crop_rect.isNull():
+            self._crop_rect = self._full_image_rect()
+        else:
+            self._crop_rect = self._clip_rect_to_image(crop_rect)
+        self.update()
+
+    def _full_image_rect(self) -> QtCore.QRectF:
+        if self._image_size.isEmpty():
+            return QtCore.QRectF()
+        return QtCore.QRectF(
+            0.0,
+            0.0,
+            float(self._image_size.width()),
+            float(self._image_size.height()),
+        )
+
+    def _clip_rect_to_image(self, rect: QtCore.QRectF) -> QtCore.QRectF:
+        if self._image_size.isEmpty():
+            return QtCore.QRectF()
+        rect = rect.normalized()
+        width = float(self._image_size.width())
+        height = float(self._image_size.height())
+        x0 = min(max(rect.x(), 0.0), width)
+        y0 = min(max(rect.y(), 0.0), height)
+        x1 = min(max(rect.x() + rect.width(), 0.0), width)
+        y1 = min(max(rect.y() + rect.height(), 0.0), height)
+        if x1 - x0 <= 0.0 or y1 - y0 <= 0.0:
+            return self._full_image_rect()
+        return QtCore.QRectF(x0, y0, x1 - x0, y1 - y0)
+
+    def _update_scaled_pixmap(self) -> None:
+        if self._pixmap.isNull():
+            self._scaled_pixmap = QtGui.QPixmap()
+            self._scale = 1.0
+            self._offset = QtCore.QPointF(0.0, 0.0)
+            return
+        self._scaled_pixmap = self._pixmap.scaled(
+            self.size(),
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.SmoothTransformation,
+        )
+        if self._pixmap.width() == 0:
+            self._scale = 1.0
+        else:
+            self._scale = self._scaled_pixmap.width() / self._pixmap.width()
+        self._offset = QtCore.QPointF(
+            (self.width() - self._scaled_pixmap.width()) / 2.0,
+            (self.height() - self._scaled_pixmap.height()) / 2.0,
+        )
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        if not self._scaled_pixmap.isNull():
+            target = QtCore.QPointF(self._offset)
+            painter.drawPixmap(target, self._scaled_pixmap)
+            if not self._crop_rect.isNull():
+                rect_widget = self._image_rect_to_widget(self._crop_rect)
+                overlay_color = QtGui.QColor(0, 180, 255)
+                painter.setPen(QtGui.QPen(overlay_color, 2))
+                painter.setBrush(QtGui.QColor(0, 180, 255, 40))
+                painter.drawRect(rect_widget)
+                handle_size = 8.0
+                painter.setBrush(overlay_color)
+                for point in self._rect_corner_points(rect_widget):
+                    handle_rect = QtCore.QRectF(
+                        point.x() - handle_size / 2.0,
+                        point.y() - handle_size / 2.0,
+                        handle_size,
+                        handle_size,
+                    )
+                    painter.drawRect(handle_rect)
+            if self._dragging and not self._drag_rect_widget.isNull():
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 1, QtCore.Qt.DashLine))
+                painter.setBrush(QtGui.QColor(255, 255, 255, 40))
+                painter.drawRect(self._drag_rect_widget)
+        painter.end()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_scaled_pixmap()
+        self.update()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if event.button() != QtCore.Qt.LeftButton or self._scaled_pixmap.isNull():
+            super().mousePressEvent(event)
+            return
+        pos = self._event_pos(event)
+        if not self._pixmap_area().contains(pos):
+            super().mousePressEvent(event)
+            return
+        self._dragging = True
+        self._drag_start = pos
+        self._drag_current = pos
+        self._drag_rect_widget = QtCore.QRectF(pos, pos)
+        self.update()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if not self._dragging:
+            super().mouseMoveEvent(event)
+            return
+        pos = self._event_pos(event)
+        self._drag_current = pos
+        self._drag_rect_widget = QtCore.QRectF(self._drag_start, self._drag_current).normalized()
+        self.update()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
+        if not self._dragging:
+            super().mouseReleaseEvent(event)
+            return
+        pos = self._event_pos(event)
+        self._dragging = False
+        self._drag_current = pos
+        drag_rect = QtCore.QRectF(self._drag_start, self._drag_current).normalized()
+        self._drag_rect_widget = QtCore.QRectF()
+        if drag_rect.width() < 3.0 or drag_rect.height() < 3.0:
+            self.update()
+            return
+        rect_img = self._widget_rect_to_image(drag_rect)
+        if rect_img.width() < 1.0 or rect_img.height() < 1.0:
+            self.update()
+            return
+        self._crop_rect = rect_img
+        self.cropChanged.emit(QtCore.QRectF(self._crop_rect))
+        self.update()
+
+    def _pixmap_area(self) -> QtCore.QRectF:
+        return QtCore.QRectF(
+            self._offset.x(),
+            self._offset.y(),
+            float(self._scaled_pixmap.width()),
+            float(self._scaled_pixmap.height()),
+        )
+
+    def _rect_corner_points(self, rect: QtCore.QRectF) -> List[QtCore.QPointF]:
+        return [
+            rect.topLeft(),
+            rect.topRight(),
+            rect.bottomRight(),
+            rect.bottomLeft(),
+        ]
+
+    def _image_rect_to_widget(self, rect: QtCore.QRectF) -> QtCore.QRectF:
+        top_left = self._image_to_widget(rect.topLeft())
+        bottom_right = self._image_to_widget(rect.bottomRight())
+        return QtCore.QRectF(top_left, bottom_right).normalized()
+
+    def _widget_rect_to_image(self, rect: QtCore.QRectF) -> QtCore.QRectF:
+        rect = rect.normalized()
+        top_left = self._widget_to_image(rect.topLeft())
+        bottom_right = self._widget_to_image(rect.bottomRight())
+        return self._clip_rect_to_image(QtCore.QRectF(top_left, bottom_right))
+
+    def _image_to_widget(self, point: QtCore.QPointF) -> QtCore.QPointF:
+        return QtCore.QPointF(
+            self._offset.x() + point.x() * self._scale,
+            self._offset.y() + point.y() * self._scale,
+        )
+
+    def _widget_to_image(self, point: QtCore.QPointF) -> QtCore.QPointF:
+        if self._scale <= 0.0:
+            return QtCore.QPointF(0.0, 0.0)
+        x = (point.x() - self._offset.x()) / self._scale
+        y = (point.y() - self._offset.y()) / self._scale
+        width = float(self._image_size.width())
+        height = float(self._image_size.height())
+        return QtCore.QPointF(
+            min(max(x, 0.0), width),
+            min(max(y, 0.0), height),
+        )
+
+    @staticmethod
+    def _event_pos(event: QtGui.QMouseEvent) -> QtCore.QPointF:
+        if hasattr(event, "position"):
+            return event.position()
+        return QtCore.QPointF(float(event.x()), float(event.y()))
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, api: ProcessingAPI) -> None:
         super().__init__()
@@ -255,13 +484,11 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addLayout(titles_layout)
 
         preview_layout = QtWidgets.QHBoxLayout()
-        self.before_image_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
+        self.before_image_view = CropPreview()
         self.after_image_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
-        self.before_image_label.setMinimumSize(200, 200)
         self.after_image_label.setMinimumSize(200, 200)
-        self.before_image_label.setFrameShape(QtWidgets.QFrame.Box)
         self.after_image_label.setFrameShape(QtWidgets.QFrame.Box)
-        preview_layout.addWidget(self.before_image_label, 1)
+        preview_layout.addWidget(self.before_image_view, 1)
         preview_layout.addWidget(self.after_image_label, 1)
         right_layout.addLayout(preview_layout)
 
@@ -272,6 +499,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_btn.clicked.connect(self._handle_preview)
         self.process_btn.clicked.connect(self._handle_process)
         self.edit_crop_btn.clicked.connect(self._open_crop_dialog)
+        self.before_image_view.cropChanged.connect(self._handle_manual_crop_rect)
 
     def _create_menus(self) -> None:
         menu = self.menuBar().addMenu("")
@@ -366,20 +594,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_preview(self, before: np.ndarray, after: np.ndarray) -> None:
         self.last_before_image = before
         self.last_after_image = after
-        self._refresh_preview_labels()
+        crop_rect = self._current_crop_rect()
+        self.before_image_view.set_image(before, crop_rect)
+        self._refresh_after_label()
 
-    def _refresh_preview_labels(self) -> None:
-        if self.last_before_image is None or self.last_after_image is None:
+    def _refresh_after_label(self) -> None:
+        if self.last_after_image is None:
+            self.after_image_label.clear()
             return
-        before_pixmap = numpy_to_qpixmap(self.last_before_image)
         after_pixmap = numpy_to_qpixmap(self.last_after_image)
-        self.before_image_label.setPixmap(
-            before_pixmap.scaled(
-                self.before_image_label.size(),
-                QtCore.Qt.KeepAspectRatio,
-                QtCore.Qt.SmoothTransformation,
-            )
-        )
         self.after_image_label.setPixmap(
             after_pixmap.scaled(
                 self.after_image_label.size(),
@@ -388,9 +611,65 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
 
+    def _current_crop_rect(self) -> QtCore.QRectF:
+        if self.last_before_image is None:
+            return QtCore.QRectF()
+        height, width = self.last_before_image.shape[:2]
+        default_rect = QtCore.QRectF(0.0, 0.0, float(width), float(height))
+        if self.current_preview_path is None:
+            return default_rect
+        stored_pts = self.api.user_crops.get(self.current_preview_path)
+        if not stored_pts:
+            return default_rect
+        pts = np.array(stored_pts, dtype=np.float32)
+        if pts.size == 0:
+            return default_rect
+        x_min = float(np.clip(pts[:, 0].min(), 0.0, width))
+        x_max = float(np.clip(pts[:, 0].max() + 1.0, 0.0, width))
+        y_min = float(np.clip(pts[:, 1].min(), 0.0, height))
+        y_max = float(np.clip(pts[:, 1].max() + 1.0, 0.0, height))
+        if x_max - x_min <= 0.0 or y_max - y_min <= 0.0:
+            return default_rect
+        return QtCore.QRectF(x_min, y_min, x_max - x_min, y_max - y_min)
+
+    def _handle_manual_crop_rect(self, rect: QtCore.QRectF) -> None:
+        if self.current_preview_path is None or self.last_before_image is None:
+            return
+        height, width = self.last_before_image.shape[:2]
+        rect = rect.normalized()
+        x0 = max(0.0, min(rect.x(), float(width)))
+        y0 = max(0.0, min(rect.y(), float(height)))
+        x1 = max(0.0, min(rect.x() + rect.width(), float(width)))
+        y1 = max(0.0, min(rect.y() + rect.height(), float(height)))
+        if x1 - x0 < 1.0 or y1 - y0 < 1.0:
+            return
+        new_margins = {
+            "left": x0,
+            "top": y0,
+            "right": max(0.0, float(width) - x1),
+            "bottom": max(0.0, float(height) - y1),
+        }
+        angle = float(self.api.user_angles.get(self.current_preview_path, 0.0))
+        try:
+            before, after = self.api.apply_crop_editor(
+                self.current_preview_path,
+                new_margins,
+                angle,
+                self._selected_film_type(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.status_label.setText(
+                self._t("status_preview_failed", "Preview failed: {}" ).format(exc)
+            )
+            return
+        self._update_preview(before, after)
+        self.status_label.setText(
+            self._t("status_preview_generated", "Preview generated for {} image(s)." ).format(1)
+        )
+
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self._refresh_preview_labels()
+        self._refresh_after_label()
 
     def _handle_process(self) -> None:
         try:
