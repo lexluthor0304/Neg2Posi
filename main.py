@@ -1,6 +1,8 @@
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import hashlib
+import io
+import re
 import shutil
 import subprocess
 import tempfile
@@ -60,6 +62,7 @@ def apply_raw_flat_field(path: str, img: np.ndarray) -> np.ndarray:
 import os
 import lensfunpy
 import threading
+import sys
 
 def apply_lensfun_correction(path: str, img: np.ndarray) -> np.ndarray:
     """
@@ -125,6 +128,59 @@ import logging # Added for consistency, though not heavily used in original GUI 
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+class _MacImkWarningFilter(io.TextIOBase):
+    __slots__ = ("_wrapped", "_buffer", "encoding", "errors", "_pattern")
+
+    def __init__(self, wrapped: io.TextIOBase, pattern: re.Pattern[str]) -> None:
+        self._wrapped = wrapped
+        self._buffer = ""
+        self.encoding = getattr(wrapped, "encoding", None)
+        self.errors = getattr(wrapped, "errors", None)
+        self._pattern = pattern
+
+    def write(self, data):  # type: ignore[override]
+        text = str(data)
+        self._buffer += text
+        count = len(text)
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if not self._pattern.search(line):
+                self._wrapped.write(line + "\n")
+        return count
+
+    def flush(self) -> None:  # type: ignore[override]
+        if self._buffer and not self._pattern.search(self._buffer):
+            self._wrapped.write(self._buffer)
+        self._buffer = ""
+        self._wrapped.flush()
+
+    def writelines(self, lines):  # type: ignore[override]
+        for line in lines:
+            self.write(line)
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
+def _install_macos_input_method_warning_filter() -> None:
+    """Suppress macOS IMKCFRunLoopWakeUpReliable stderr spam from Qt."""
+
+    if sys.platform != "darwin":  # pragma: no cover - platform specific
+        return
+
+    pattern = re.compile(r"IMKCFRunLoopWakeUpReliable")
+    original_stderr = sys.stderr
+
+    # Avoid wrapping multiple times (e.g. in reload scenarios)
+    if isinstance(original_stderr, _MacImkWarningFilter):
+        return
+
+    sys.stderr = _MacImkWarningFilter(original_stderr, pattern)  # type: ignore[assignment]
+
+
+_install_macos_input_method_warning_filter()
 
 
 
@@ -1128,8 +1184,6 @@ def launch_qt_ui() -> None:
 
 
 if __name__ == '__main__':
-    import sys
-
     if len(sys.argv) > 1 and sys.argv[1] == '--cli':
         if len(sys.argv) < 5:  # python main.py --cli <input_path> <output_path> <film_type: color/bw>
             print("Usage: python main.py --cli <input_path> <output_path> <film_type (color or bw)>")
