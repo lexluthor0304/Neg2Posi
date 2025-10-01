@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import functools
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, MutableMapping, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -12,11 +13,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 @dataclass
 class ProcessingAPI:
     preview_images: Callable[[str, str], Tuple[np.ndarray, np.ndarray]]
-    process_path: Callable[[str, str, str, bool, Optional[MutableMapping[str, Iterable[Tuple[float, float]]]]], None]
-    apply_crop_editor: Callable[[str, Dict[str, float], float, str], Tuple[np.ndarray, np.ndarray]]
-    get_crop_settings: Callable[[str], Tuple[Dict[str, float], float]]
-    user_crops: MutableMapping[str, Iterable[Tuple[float, float]]]
-    user_angles: MutableMapping[str, float]
+    process_path: Callable[[str, str, str, bool], None]
+    set_adjustments: Callable[[float, float, float, float], None]
+    get_adjustments: Callable[[], Tuple[float, float, float, float]]
+    set_manual_crop_points: Callable[[str, Iterable[Tuple[float, float]], float], None]
+    get_manual_crop_points: Callable[[str], Optional[List[Tuple[float, float]]]]
+    clear_manual_crop: Callable[[str], None]
     allowed_extensions: Tuple[str, ...]
 
 
@@ -57,67 +59,6 @@ def numpy_to_qpixmap(arr: np.ndarray) -> QtGui.QPixmap:
     raise ValueError("Unsupported image data for preview")
 
 
-class CropDialog(QtWidgets.QDialog):
-    def __init__(
-        self,
-        parent: QtWidgets.QWidget,
-        translations: Dict[str, str],
-        margins: Dict[str, float],
-        angle: float,
-        img_shape: Tuple[int, int],
-    ) -> None:
-        super().__init__(parent)
-        self._t = translations
-        self.setWindowTitle(self._t.get("crop_editor_title", "Edit Crop"))
-        self.setModal(True)
-        h, w = img_shape
-
-        layout = QtWidgets.QFormLayout(self)
-
-        self.left_spin = QtWidgets.QSpinBox()
-        self.left_spin.setRange(0, max(0, w - 1))
-        self.left_spin.setValue(int(round(margins.get("left", 0.0))))
-
-        self.right_spin = QtWidgets.QSpinBox()
-        self.right_spin.setRange(0, max(0, w - 1))
-        self.right_spin.setValue(int(round(margins.get("right", 0.0))))
-
-        self.top_spin = QtWidgets.QSpinBox()
-        self.top_spin.setRange(0, max(0, h - 1))
-        self.top_spin.setValue(int(round(margins.get("top", 0.0))))
-
-        self.bottom_spin = QtWidgets.QSpinBox()
-        self.bottom_spin.setRange(0, max(0, h - 1))
-        self.bottom_spin.setValue(int(round(margins.get("bottom", 0.0))))
-
-        self.angle_spin = QtWidgets.QDoubleSpinBox()
-        self.angle_spin.setRange(-180.0, 180.0)
-        self.angle_spin.setDecimals(2)
-        self.angle_spin.setSingleStep(0.5)
-        self.angle_spin.setValue(float(angle))
-
-        layout.addRow(self._t.get("crop_margin_left", "Left (px)"), self.left_spin)
-        layout.addRow(self._t.get("crop_margin_right", "Right (px)"), self.right_spin)
-        layout.addRow(self._t.get("crop_margin_top", "Top (px)"), self.top_spin)
-        layout.addRow(self._t.get("crop_margin_bottom", "Bottom (px)"), self.bottom_spin)
-        layout.addRow(self._t.get("crop_rotation_angle", "Rotation Angle (°)"), self.angle_spin)
-
-        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        button_box.button(QtWidgets.QDialogButtonBox.Ok).setText(self._t.get("dialog_crop_apply", "Apply"))
-        button_box.button(QtWidgets.QDialogButtonBox.Cancel).setText(self._t.get("dialog_crop_cancel", "Cancel"))
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addRow(button_box)
-
-    def values(self) -> Tuple[Dict[str, float], float]:
-        return {
-            "left": float(self.left_spin.value()),
-            "right": float(self.right_spin.value()),
-            "top": float(self.top_spin.value()),
-            "bottom": float(self.bottom_spin.value()),
-        }, float(self.angle_spin.value())
-
-
 class CropPreview(QtWidgets.QFrame):
     cropChanged = QtCore.Signal(QtCore.QRectF)
 
@@ -127,6 +68,7 @@ class CropPreview(QtWidgets.QFrame):
         self.setLineWidth(1)
         self.setMinimumSize(200, 200)
         self.setCursor(QtCore.Qt.CrossCursor)
+        self._interactive_enabled = True
         self._pixmap = QtGui.QPixmap()
         self._scaled_pixmap = QtGui.QPixmap()
         self._image_size = QtCore.QSize()
@@ -140,6 +82,10 @@ class CropPreview(QtWidgets.QFrame):
 
     def sizeHint(self) -> QtCore.QSize:  # noqa: D401, N802
         return QtCore.QSize(320, 320)
+
+    def set_interactive(self, enabled: bool) -> None:
+        self._interactive_enabled = bool(enabled)
+        self.setCursor(QtCore.Qt.CrossCursor if self._interactive_enabled else QtCore.Qt.ArrowCursor)
 
     def clear(self) -> None:
         self._pixmap = QtGui.QPixmap()
@@ -253,7 +199,8 @@ class CropPreview(QtWidgets.QFrame):
         self.update()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
-        if event.button() != QtCore.Qt.LeftButton or self._scaled_pixmap.isNull():
+        if (not self._interactive_enabled or event.button() != QtCore.Qt.LeftButton or
+                self._scaled_pixmap.isNull()):
             super().mousePressEvent(event)
             return
         pos = self._event_pos(event)
@@ -267,7 +214,7 @@ class CropPreview(QtWidgets.QFrame):
         self.update()
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
-        if not self._dragging:
+        if not self._interactive_enabled or not self._dragging:
             super().mouseMoveEvent(event)
             return
         pos = self._event_pos(event)
@@ -276,7 +223,7 @@ class CropPreview(QtWidgets.QFrame):
         self.update()
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
-        if not self._dragging:
+        if not self._interactive_enabled or not self._dragging:
             super().mouseReleaseEvent(event)
             return
         pos = self._event_pos(event)
@@ -356,12 +303,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_preview_path: Optional[str] = None
         self.last_before_image: Optional[np.ndarray] = None
         self.last_after_image: Optional[np.ndarray] = None
+        self._adjustment_sync_in_progress = False
 
         self._load_translations("en")
         self._build_ui()
         self._create_menus()
         self._apply_translations()
         self.status_label.setText(self._t("status_ready", "Ready."))
+        self._load_initial_adjustments()
 
     # ------------------------------------------------------------------
     # Translation helpers
@@ -393,13 +342,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.choose_output_btn.setText(self._t("choose_output", "Choose Output Dir"))
         self.preview_btn.setText(self._t("preview", "Preview"))
         self.process_btn.setText(self._t("process", "Process"))
-        self.edit_crop_btn.setText(self._t("edit_crop_button", "Edit Crop"))
         self.film_type_group_box.setTitle(self._t("film_type_label", "Processing Mode:"))
         self.color_radio.setText(self._t("film_type_color", "Color Negative"))
         self.bw_radio.setText(self._t("film_type_bw", "B&W Negative"))
         self.before_label.setText(self._t("label_before", "Before"))
         self.after_label.setText(self._t("label_after", "After"))
         self.status_label.setText(self._t("status_ready", "Ready."))
+        self.adjustments_group.setTitle(self._t("adjustments_group", "Adjustments"))
+        for key, label in self.adjustment_labels.items():
+            translation_key = self._adjustment_label_keys.get(key, key)
+            fallback = key.capitalize()
+            label.setText(self._t(translation_key, fallback))
+        self.adjustments_reset_btn.setText(self._t("adjustments_reset", "Reset"))
 
         language_menu = self.menuBar().findChild(QtWidgets.QMenu, "menu_language")
         if language_menu is not None:
@@ -457,12 +411,49 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.preview_btn = QtWidgets.QPushButton()
         self.process_btn = QtWidgets.QPushButton()
-        self.edit_crop_btn = QtWidgets.QPushButton()
         button_row = QtWidgets.QHBoxLayout()
         button_row.addWidget(self.preview_btn)
         button_row.addWidget(self.process_btn)
         left_layout.addLayout(button_row)
-        left_layout.addWidget(self.edit_crop_btn)
+
+        self.adjustments_group = QtWidgets.QGroupBox()
+        adjustments_layout = QtWidgets.QGridLayout(self.adjustments_group)
+        self._adjustment_label_keys = {
+            "brightness": "label_brightness",
+            "cyan": "label_cyan",
+            "magenta": "label_magenta",
+            "yellow": "label_yellow",
+        }
+        self.adjustment_labels: Dict[str, QtWidgets.QLabel] = {}
+        self.adjustment_sliders: Dict[str, QtWidgets.QSlider] = {}
+        self.adjustment_spinboxes: Dict[str, QtWidgets.QSpinBox] = {}
+        specs = [
+            ("brightness", -100, 100),
+            ("cyan", -100, 100),
+            ("magenta", -100, 100),
+            ("yellow", -100, 100),
+        ]
+        for row, (key, min_val, max_val) in enumerate(specs):
+            label = QtWidgets.QLabel()
+            slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            slider.setRange(min_val, max_val)
+            slider.setSingleStep(1)
+            slider.setPageStep(5)
+            slider.setValue(0)
+            spin = QtWidgets.QSpinBox()
+            spin.setRange(min_val, max_val)
+            spin.setValue(0)
+            slider.valueChanged.connect(functools.partial(self._on_adjustment_slider_changed, key))
+            spin.valueChanged.connect(functools.partial(self._on_adjustment_spin_changed, key))
+            adjustments_layout.addWidget(label, row, 0)
+            adjustments_layout.addWidget(slider, row, 1)
+            adjustments_layout.addWidget(spin, row, 2)
+            self.adjustment_labels[key] = label
+            self.adjustment_sliders[key] = slider
+            self.adjustment_spinboxes[key] = spin
+        self.adjustments_reset_btn = QtWidgets.QPushButton()
+        adjustments_layout.addWidget(self.adjustments_reset_btn, len(specs), 0, 1, 3)
+        left_layout.addWidget(self.adjustments_group)
 
         self.status_label = QtWidgets.QLabel()
         self.status_label.setWordWrap(True)
@@ -485,6 +476,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         preview_layout = QtWidgets.QHBoxLayout()
         self.before_image_view = CropPreview()
+        self.before_image_view.set_interactive(True)
         self.after_image_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
         self.after_image_label.setMinimumSize(200, 200)
         self.after_image_label.setFrameShape(QtWidgets.QFrame.Box)
@@ -498,7 +490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.choose_output_btn.clicked.connect(self._choose_output)
         self.preview_btn.clicked.connect(self._handle_preview)
         self.process_btn.clicked.connect(self._handle_process)
-        self.edit_crop_btn.clicked.connect(self._open_crop_dialog)
+        self.adjustments_reset_btn.clicked.connect(self._reset_adjustments)
         self.before_image_view.cropChanged.connect(self._handle_manual_crop_rect)
 
     def _create_menus(self) -> None:
@@ -618,17 +610,17 @@ class MainWindow(QtWidgets.QMainWindow):
         default_rect = QtCore.QRectF(0.0, 0.0, float(width), float(height))
         if self.current_preview_path is None:
             return default_rect
-        stored_pts = self.api.user_crops.get(self.current_preview_path)
-        if not stored_pts:
+        pts = self.api.get_manual_crop_points(self.current_preview_path)
+        if not pts:
             return default_rect
-        pts = np.array(stored_pts, dtype=np.float32)
-        if pts.size == 0:
+        arr = np.array(pts, dtype=np.float32)
+        if arr.size != 8:
             return default_rect
-        x_min = float(np.clip(pts[:, 0].min(), 0.0, width))
-        x_max = float(np.clip(pts[:, 0].max() + 1.0, 0.0, width))
-        y_min = float(np.clip(pts[:, 1].min(), 0.0, height))
-        y_max = float(np.clip(pts[:, 1].max() + 1.0, 0.0, height))
-        if x_max - x_min <= 0.0 or y_max - y_min <= 0.0:
+        x_min = float(np.clip(arr[:, 0].min(), 0.0, width))
+        x_max = float(np.clip(arr[:, 0].max(), 0.0, width))
+        y_min = float(np.clip(arr[:, 1].min(), 0.0, height))
+        y_max = float(np.clip(arr[:, 1].max(), 0.0, height))
+        if x_max - x_min <= 1.0 or y_max - y_min <= 1.0:
             return default_rect
         return QtCore.QRectF(x_min, y_min, x_max - x_min, y_max - y_min)
 
@@ -643,20 +635,15 @@ class MainWindow(QtWidgets.QMainWindow):
         y1 = max(0.0, min(rect.y() + rect.height(), float(height)))
         if x1 - x0 < 1.0 or y1 - y0 < 1.0:
             return
-        new_margins = {
-            "left": x0,
-            "top": y0,
-            "right": max(0.0, float(width) - x1),
-            "bottom": max(0.0, float(height) - y1),
-        }
-        angle = float(self.api.user_angles.get(self.current_preview_path, 0.0))
+        pts = [
+            (x0, y0),
+            (x1, y0),
+            (x1, y1),
+            (x0, y1),
+        ]
+        self.api.set_manual_crop_points(self.current_preview_path, pts, 0.0)
         try:
-            before, after = self.api.apply_crop_editor(
-                self.current_preview_path,
-                new_margins,
-                angle,
-                self._selected_film_type(),
-            )
+            before, after = self.api.preview_images(self.current_preview_path, self._selected_film_type())
         except Exception as exc:  # noqa: BLE001
             self.status_label.setText(
                 self._t("status_preview_failed", "Preview failed: {}" ).format(exc)
@@ -666,6 +653,67 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status_label.setText(
             self._t("status_preview_generated", "Preview generated for {} image(s)." ).format(1)
         )
+
+    def _on_adjustment_slider_changed(self, key: str, value: int) -> None:
+        spin = self.adjustment_spinboxes[key]
+        if spin.value() != value:
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+        self._handle_adjustment_change()
+
+    def _on_adjustment_spin_changed(self, key: str, value: int) -> None:
+        slider = self.adjustment_sliders[key]
+        if slider.value() != value:
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+        self._handle_adjustment_change()
+
+    def _handle_adjustment_change(self) -> None:
+        if self._adjustment_sync_in_progress:
+            return
+        brightness = self.adjustment_sliders["brightness"].value() / 100.0
+        cyan = self.adjustment_sliders["cyan"].value() / 100.0
+        magenta = self.adjustment_sliders["magenta"].value() / 100.0
+        yellow = self.adjustment_sliders["yellow"].value() / 100.0
+        self.api.set_adjustments(brightness, cyan, magenta, yellow)
+        if self.current_preview_path is None:
+            return
+        try:
+            before, after = self.api.preview_images(self.current_preview_path, self._selected_film_type())
+        except Exception as exc:  # noqa: BLE001
+            self.status_label.setText(
+                self._t("status_preview_failed", "Preview failed: {}" ).format(exc)
+            )
+            return
+        self._update_preview(before, after)
+
+    def _reset_adjustments(self) -> None:
+        self._adjustment_sync_in_progress = True
+        try:
+            for slider in self.adjustment_sliders.values():
+                slider.setValue(0)
+        finally:
+            self._adjustment_sync_in_progress = False
+        self._handle_adjustment_change()
+
+    def _load_initial_adjustments(self) -> None:
+        brightness, cyan, magenta, yellow = self.api.get_adjustments()
+        values = {
+            "brightness": int(round(brightness * 100)),
+            "cyan": int(round(cyan * 100)),
+            "magenta": int(round(magenta * 100)),
+            "yellow": int(round(yellow * 100)),
+        }
+        self._adjustment_sync_in_progress = True
+        try:
+            for key, slider in self.adjustment_sliders.items():
+                val = values.get(key, 0)
+                slider.setValue(val)
+        finally:
+            self._adjustment_sync_in_progress = False
+        self._handle_adjustment_change()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -688,7 +736,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 out_dir,
                 film_type,
                 recurse=base_path.is_dir(),
-                crop_dict=self.api.user_crops,
             )
         except Exception as exc:  # noqa: BLE001
             self.status_label.setText(
@@ -696,41 +743,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         self.status_label.setText(self._t("status_processing_complete", "Processing finished."))
-
-    def _open_crop_dialog(self) -> None:
-        if self.current_preview_path is None:
-            self.status_label.setText(self._t("status_no_images", "No supported image files found."))
-            return
-        if self.last_before_image is None:
-            try:
-                before, after = self.api.preview_images(self.current_preview_path, self._selected_film_type())
-            except Exception as exc:  # noqa: BLE001
-                self.status_label.setText(
-                    self._t("status_preview_failed", "Preview failed: {}" ).format(exc)
-                )
-                return
-            self._update_preview(before, after)
-        margins, angle = self.api.get_crop_settings(self.current_preview_path)
-        dialog = CropDialog(self, self.translations, margins, angle, self.last_before_image.shape[:2])
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
-            new_margins, new_angle = dialog.values()
-            try:
-                before, after = self.api.apply_crop_editor(
-                    self.current_preview_path,
-                    new_margins,
-                    new_angle,
-                    self._selected_film_type(),
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.status_label.setText(
-                    self._t("status_preview_failed", "Preview failed: {}" ).format(exc)
-                )
-                return
-            self._update_preview(before, after)
-            self.status_label.setText(
-                self._t("status_preview_generated", "Preview generated for {} image(s)." ).format(1)
-            )
-
 
 def run_qt_app(api: ProcessingAPI) -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])

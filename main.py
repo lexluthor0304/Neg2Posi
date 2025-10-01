@@ -1,3 +1,9 @@
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+import hashlib
+import shutil
+import subprocess
+import tempfile
 import numpy as np
 import cv2
 import exifread
@@ -18,6 +24,9 @@ try:
     RAW_SUPPORTED = True
 except ImportError:
     RAW_SUPPORTED = False
+
+FFMPEG_BIN = shutil.which("ffmpeg")
+FFMPEG_SUPPORTED = FFMPEG_BIN is not None
 
 # Flat-field correction using RAW metadata shading map
 def apply_raw_flat_field(path: str, img: np.ndarray) -> np.ndarray:
@@ -122,12 +131,152 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 FILM_TYPE_COLOR_INTERNAL_KEY = "color"
 FILM_TYPE_BW_INTERNAL_KEY = "bw"
 
+RAW_EXTS = ('.dng', '.cr2', '.nef', '.arw', '.raf')
+
 
 
 # Global storage for manual crop overrides
 user_crops = {}
 # Global storage for manual rotation overrides (degrees)
 user_angles = {}
+
+
+@dataclass
+class AdjustmentState:
+    brightness: float = 0.0
+    cyan: float = 0.0
+    magenta: float = 0.0
+    yellow: float = 0.0
+
+
+_current_adjustments = AdjustmentState()
+
+
+def set_adjustments(brightness: float, cyan: float, magenta: float, yellow: float) -> None:
+    """Update global tone adjustment settings."""
+
+    _current_adjustments.brightness = float(brightness)
+    _current_adjustments.cyan = float(cyan)
+    _current_adjustments.magenta = float(magenta)
+    _current_adjustments.yellow = float(yellow)
+
+
+def get_adjustments() -> tuple[float, float, float, float]:
+    """Return the current tone adjustment settings as a tuple."""
+
+    adj = _current_adjustments
+    return adj.brightness, adj.cyan, adj.magenta, adj.yellow
+
+
+def set_manual_crop_points(
+    path: str | os.PathLike[str],
+    points: Iterable[tuple[float, float]],
+    angle: float = 0.0,
+) -> None:
+    """Store manual crop points for *path*; clears overrides if points invalid."""
+
+    pts_array = _prepare_override_points(points)
+    if pts_array is None:
+        clear_manual_crop(path)
+        return
+    pts_iter = [(float(x), float(y)) for x, y in pts_array]
+    _store_user_override(path, pts_iter, angle)
+
+
+def clear_manual_crop(path: str | os.PathLike[str]) -> None:
+    """Remove any stored manual crop/angle overrides for *path*."""
+
+    norm_key = _normalize_path_key(path)
+    for key in list(user_crops.keys()):
+        if _normalize_path_key(key) == norm_key:
+            user_crops.pop(key, None)
+    for key in list(user_angles.keys()):
+        if _normalize_path_key(key) == norm_key:
+            user_angles.pop(key, None)
+
+
+def get_manual_crop_points(
+    path: str | os.PathLike[str],
+) -> list[tuple[float, float]] | None:
+    """Return stored manual crop points for *path* if available."""
+
+    pts = _lookup_override_points(path)
+    if not pts:
+        return None
+    return [(float(x), float(y)) for x, y in pts]
+
+
+def _normalize_path_key(path: str | os.PathLike[str]) -> str:
+    """Return a normalized absolute key for *path* suitable for dict lookups."""
+
+    return os.path.abspath(os.path.expanduser(str(path)))
+
+
+def _lookup_override_points(
+    path: str | os.PathLike[str],
+    overrides: Mapping[str, Iterable[tuple[float, float]]] | None = None,
+) -> Iterable[tuple[float, float]] | None:
+    """Fetch stored crop points for *path*, trying common path variants."""
+
+    if overrides is None:
+        overrides = user_crops
+    raw = str(path)
+    norm = os.path.normpath(raw)
+    abs_key = _normalize_path_key(raw)
+    for key in {raw, norm, abs_key}:
+        if key in overrides:
+            return overrides[key]
+    target = abs_key
+    for key, pts in overrides.items():
+        if _normalize_path_key(key) == target:
+            return pts
+    return None
+
+
+def _lookup_override_angle(
+    path: str | os.PathLike[str],
+    angles: Mapping[str, float] | None = None,
+) -> float:
+    """Fetch stored rotation angle for *path*, falling back to 0."""
+
+    if angles is None:
+        angles = user_angles
+    raw = str(path)
+    norm = os.path.normpath(raw)
+    abs_key = _normalize_path_key(raw)
+    for key in {raw, norm, abs_key}:
+        if key in angles:
+            return float(angles[key])
+    target = abs_key
+    for key, value in angles.items():
+        if _normalize_path_key(key) == target:
+            return float(value)
+    return 0.0
+
+
+def _store_user_override(
+    path: str | os.PathLike[str],
+    pts: Iterable[tuple[float, float]],
+    angle: float,
+) -> None:
+    """Persist manual crop *pts* and *angle* under raw and normalized keys."""
+
+    norm_key = _normalize_path_key(path)
+    raw_key = str(path)
+    keys_to_keep = {raw_key, norm_key}
+    pts_list = [(float(x), float(y)) for x, y in pts]
+    angle_val = float(angle)
+    for key in keys_to_keep:
+        user_crops[key] = pts_list
+        user_angles[key] = angle_val
+    for key in list(user_crops.keys()):
+        if key not in keys_to_keep and _normalize_path_key(key) == norm_key:
+            user_crops.pop(key, None)
+    for key in list(user_angles.keys()):
+        if key not in keys_to_keep and _normalize_path_key(key) == norm_key:
+            user_angles.pop(key, None)
+
+
 def load_image(path):
     # Coerce path from nested tuple/list to a string path
     while isinstance(path, (tuple, list)):
@@ -137,10 +286,17 @@ def load_image(path):
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(f"File not found: {path}")
-    if RAW_SUPPORTED and p.suffix.lower() in ('.cr2', '.nef', '.arw', '.raf', '.dng'):
-        raw = rawpy.imread(str(p))
-        rgb = raw.postprocess(no_auto_bright=True, gamma=(1,1), output_bps=16)
-        return rgb.astype(np.float32) / 65535.0
+    suffix = p.suffix.lower()
+    if suffix in RAW_EXTS:
+        if RAW_SUPPORTED:
+            raw = rawpy.imread(str(p))
+            rgb = raw.postprocess(no_auto_bright=True, gamma=(1, 1), output_bps=16)
+            return rgb.astype(np.float32) / 65535.0
+        if FFMPEG_SUPPORTED:
+            return _load_raw_with_ffmpeg(str(p))
+        raise RuntimeError(
+            "RAW formats require the 'rawpy' package or system ffmpeg for decoding."
+        )
     bgr = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
     if bgr is not None:
         # Handle images with alpha channel by converting to RGB
@@ -154,11 +310,11 @@ def load_image(path):
 
 def save_image(rgb, path):
     rgb_clipped = np.clip(rgb, 0.0, 1.0)
-    out_16 = (rgb_clipped * 65535.0 + 0.5).astype(np.uint16)
-    if out_16.ndim == 2:
-        bgr = cv2.cvtColor(out_16, cv2.COLOR_GRAY2BGR)
+    out_8 = (rgb_clipped * 255.0 + 0.5).astype(np.uint8)
+    if out_8.ndim == 2:
+        bgr = cv2.cvtColor(out_8, cv2.COLOR_GRAY2BGR)
     else:
-        bgr = cv2.cvtColor(out_16, cv2.COLOR_RGB2BGR)
+        bgr = cv2.cvtColor(out_8, cv2.COLOR_RGB2BGR)
     path_obj = Path(path)
     path_obj.parent.mkdir(parents=True, exist_ok=True)
     png_path = path_obj.with_suffix(".png")
@@ -168,17 +324,160 @@ def save_image(rgb, path):
         logging.warning(f"cv2.imwrite failed for {png_path}, attempting PIL fallback (8-bit conversion).")
         try:
             from PIL import Image as PILImage
-            fallback_rgb = (rgb_clipped * 255.0 + 0.5).astype(np.uint8)
-            if fallback_rgb.ndim == 2:
-                PILImage.fromarray(fallback_rgb, mode="L").save(str(png_path))
+            if out_8.ndim == 2:
+                PILImage.fromarray(out_8, mode="L").save(str(png_path))
             else:
-                PILImage.fromarray(fallback_rgb, mode="RGB").save(str(png_path))
+                PILImage.fromarray(out_8, mode="RGB").save(str(png_path))
             logging.info(f"PIL fallback save succeeded: {png_path}")
         except Exception as e_fallback:
             raise IOError(
                 f"Failed to write image PNG to {png_path} via cv2 and PIL fallback: {e_fallback}"
             ) from e_fallback
-    logging.info(f"Saved 16-bit PNG: {png_path}")
+    logging.info(f"Saved 8-bit PNG: {png_path}")
+
+
+def _prepare_override_points(
+    override_pts: Iterable[tuple[float, float]] | np.ndarray | None,
+) -> np.ndarray | None:
+    """Convert *override_pts* to a normalized float32 array if valid."""
+
+    if override_pts is None:
+        return None
+    if isinstance(override_pts, np.ndarray):
+        pts = np.array(override_pts, dtype=np.float32, copy=False)
+    else:
+        pts = np.array(list(override_pts), dtype=np.float32)
+    if pts.shape != (4, 2):
+        return None
+    return order_points(pts)
+
+
+def _ffmpeg_cache_path(source: str) -> Path:
+    """Return deterministic cache path for the ffmpeg conversion of *source*."""
+
+    cache_root = Path(tempfile.gettempdir()) / "neg2posi_ffmpeg_cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(_normalize_path_key(source).encode()).hexdigest()
+    return cache_root / f"{digest}.png"
+
+
+def _load_raw_with_ffmpeg(path: str) -> np.ndarray:
+    """Decode RAW image at *path* via ffmpeg fallback."""
+
+    if not FFMPEG_SUPPORTED:
+        raise RuntimeError("ffmpeg is not available for RAW conversion fallback.")
+    cache_path = _ffmpeg_cache_path(path)
+    src_mtime = Path(path).stat().st_mtime
+    needs_convert = True
+    if cache_path.exists():
+        needs_convert = cache_path.stat().st_mtime < src_mtime
+    if needs_convert:
+        cmd = [
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            path,
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "rgb48le",
+            str(cache_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as exc:  # noqa: PERF203
+            raise RuntimeError(
+                "ffmpeg failed to convert RAW input. Install 'rawpy' or ensure ffmpeg can decode this format."
+            ) from exc
+    with Image.open(cache_path) as im:
+        arr = np.array(im)
+    if arr.dtype == np.uint16:
+        return arr.astype(np.float32) / 65535.0
+    return arr.astype(np.float32) / 255.0
+
+
+def _apply_geometry(
+    img: np.ndarray,
+    film_type: str,
+    override_pts: np.ndarray | None,
+    override_angle: float = 0.0,
+) -> np.ndarray:
+    """Normalize image geometry via manual overrides or auto detection."""
+
+    if override_pts is not None and len(override_pts) == 4:
+        if abs(override_angle) > 0.001:
+            h_orig, w_orig = img.shape[:2]
+            M_rot = cv2.getRotationMatrix2D((w_orig / 2, h_orig / 2), -override_angle, 1.0)
+            img = cv2.warpAffine(
+                img,
+                M_rot,
+                (w_orig, h_orig),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+        return crop_and_warp(img, override_pts)
+
+    if film_type == FILM_TYPE_BW_INTERNAL_KEY:
+        return rotate_and_crop_bw(img)
+    return rotate_and_crop_color(img)
+
+
+def _apply_tone_adjustments(img: np.ndarray) -> np.ndarray:
+    """Apply brightness and CMY adjustments to *img* in-place-safe manner."""
+
+    adj = _current_adjustments
+    if not any((adj.brightness, adj.cyan, adj.magenta, adj.yellow)):
+        return np.clip(img, 0.0, 1.0)
+    out = img.astype(np.float32, copy=True)
+    if adj.brightness:
+        out += adj.brightness
+    if out.ndim == 3 and out.shape[2] >= 3:
+        if adj.cyan:
+            out[..., 0] -= adj.cyan
+        if adj.magenta:
+            out[..., 1] -= adj.magenta
+        if adj.yellow:
+            out[..., 2] -= adj.yellow
+    return np.clip(out, 0.0, 1.0)
+
+
+def _process_loaded_image(
+    img_original: np.ndarray,
+    in_path: str,
+    film_type: str,
+    low_pct: float,
+    high_pct: float,
+    override_pts: Iterable[tuple[float, float]] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Run the full processing pipeline starting from a preloaded image."""
+
+    img = np.array(img_original, dtype=np.float32, copy=True)
+
+    suffix = Path(in_path).suffix.lower()
+    if RAW_SUPPORTED and suffix in ('.dng', '.cr2', '.nef', '.arw', '.raf'):
+        img = apply_raw_flat_field(in_path, img)
+
+    try:
+        img = apply_lensfun_correction(in_path, img)
+    except Exception as e_lf:  # noqa: BLE001
+        logging.warning(f"Lensfun correction failed: {e_lf}")
+
+    override_pts_effective = (
+        override_pts if override_pts is not None else _lookup_override_points(in_path)
+    )
+    pts_array = _prepare_override_points(override_pts_effective)
+    angle = _lookup_override_angle(in_path) if pts_array is not None else 0.0
+    img_geom = _apply_geometry(img, film_type, pts_array, angle)
+
+    if film_type == FILM_TYPE_BW_INTERNAL_KEY:
+        img_corr = process_bw_pipeline(img_geom, low_pct, high_pct, apply_geometry=False)
+    else:
+        img_corr = process_color_pipeline(img_geom, low_pct, high_pct, apply_geometry=False)
+    return _apply_tone_adjustments(img_corr)
 
 
 def order_points(pts):
@@ -437,10 +736,11 @@ def crop_and_warp(img, src_pts):
 
     dst = np.array([[0,0], [maxW-1,0], [maxW-1,maxH-1], [0,maxH-1]], dtype='float32')
     M = cv2.getPerspectiveTransform(src_pts, dst)
-    # Ensure image is uint8 for warpPerspective if it came in as float
-    img_u8 = (img * 255).astype(np.uint8) if img.dtype == np.float32 else img
-    warped = cv2.warpPerspective(img_u8, M, (maxW, maxH))
-    return warped.astype(np.float32) / 255.0
+    if img.dtype not in (np.float32, np.float64):
+        warped = cv2.warpPerspective(img, M, (maxW, maxH))
+        return warped.astype(np.float32) / 255.0 if warped.dtype == np.uint8 else warped.astype(np.float32)
+    warped = cv2.warpPerspective(img, M, (maxW, maxH))
+    return warped.astype(np.float32)
 
 
 def rotate_and_crop_bw(img: np.ndarray) -> np.ndarray:
@@ -496,7 +796,8 @@ def rotate_and_crop_color(img: np.ndarray) -> np.ndarray:
 
 def process_bw_pipeline(img: np.ndarray,
                         low_pct: float = 1.0,
-                        high_pct: float = 99.0) -> np.ndarray:
+                        high_pct: float = 99.0,
+                        apply_geometry: bool = True) -> np.ndarray:
     """
     Re‑designed B&W negative pipeline (v2):
     1. Optional geometric correction via rotate_and_crop_bw.
@@ -507,7 +808,8 @@ def process_bw_pipeline(img: np.ndarray,
     6. Replicate to 3‑channel RGB for downstream consistency.
     """
     # ---------- 1.  geometric cleanup ----------
-    img = rotate_and_crop_bw(img)            # falls back to original if detection fails
+    if apply_geometry:
+        img = rotate_and_crop_bw(img)            # falls back to original if detection fails
     if img.size == 0 or img.shape[0] < 4 or img.shape[1] < 4:
         # Return tiny placeholder to avoid downstream errors
         return np.zeros((120, 120, 3), dtype=np.float32)
@@ -536,8 +838,12 @@ def process_bw_pipeline(img: np.ndarray,
     out = np.stack([gray_eq, gray_eq, gray_eq], axis=2)
     return out
 
-def process_color_pipeline(img: np.ndarray, low_pct: float, high_pct: float) -> np.ndarray:
-    img = rotate_and_crop_color(img)
+def process_color_pipeline(img: np.ndarray,
+                           low_pct: float,
+                           high_pct: float,
+                           apply_geometry: bool = True) -> np.ndarray:
+    if apply_geometry:
+        img = rotate_and_crop_color(img)
     if img.size == 0 or img.shape[0] < 2 or img.shape[1] < 2: return np.zeros((100,100,3), dtype=np.float32) # Handle empty crop
     img_inv = 1.0 - img
     black_pts = np.percentile(img_inv, low_pct, axis=(0,1))
@@ -553,40 +859,15 @@ def process_color_pipeline(img: np.ndarray, low_pct: float, high_pct: float) -> 
 
 # MODIFIED: rt_auto_cast_removal to accept film_type
 def rt_auto_cast_removal(in_path, out_path, film_type: str, low_pct=0.5, high_pct=99.5, override_pts=None):
-    img = load_image(in_path)
-
-    # If RAW and shading metadata available, apply flat-field correction
-    if RAW_SUPPORTED and Path(in_path).suffix.lower() in ('.dng', '.cr2', '.nef', '.arw', '.raf'):
-        img = apply_raw_flat_field(in_path, img)
-
-    # Lensfun automatic flat-field (vignetting & distortion) correction
-    try:
-        img = apply_lensfun_correction(in_path, img)
-    except Exception as e_lf:
-        logging.warning(f"Lensfun correction failed: {e_lf}")
-    
-    # User-defined crop takes precedence over auto-detection within pipelines
-    if override_pts is not None and len(override_pts) == 4:
-        angle = user_angles.get(in_path, 0.0)
-        if abs(angle) > 0.001:
-            h_orig, w_orig = img.shape[:2]
-            M_rot = cv2.getRotationMatrix2D((w_orig/2, h_orig/2), -angle, 1.0) # Negative angle for correction
-            img = cv2.warpAffine(img, M_rot, (w_orig, h_orig),
-                                 flags=cv2.INTER_LINEAR,
-                                 borderMode=cv2.BORDER_CONSTANT,
-                                 borderValue=(0,0,0))
-        img = crop_and_warp(img, np.array(override_pts, dtype=np.float32))
-        # After manual crop, the pipelines should not re-crop but only process
-        # We can pass the already cropped image to simpler versions of pipelines
-        # For now, the existing pipelines will try to re-crop; this is acceptable.
-        # Or, modify pipelines to skip cropping if image is pre-cropped.
-
-    # Film type selection determines the pipeline
-    if film_type == FILM_TYPE_BW_INTERNAL_KEY:
-        img_corr = process_bw_pipeline(img, low_pct, high_pct)
-    else: # Default to color
-        img_corr = process_color_pipeline(img, low_pct, high_pct)
-        
+    img_original = load_image(in_path)
+    img_corr = _process_loaded_image(
+        img_original,
+        in_path,
+        film_type,
+        low_pct,
+        high_pct,
+        override_pts=override_pts,
+    )
     save_image(img_corr, out_path)
 
 
@@ -612,39 +893,16 @@ ALLOWED_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff',
 
 def _preview_images(in_path: str, film_type: str):
     before = load_image(in_path)
-    after = None # Initialize after
-    
-    override_pts = user_crops.get(in_path)
-    img_to_process = before.copy() # Start with a copy of the original
-
-    if override_pts:
-        angle = user_angles.get(in_path, 0.0)
-        if abs(angle) > 0.001:
-            h, w = img_to_process.shape[:2]
-            M = cv2.getRotationMatrix2D((w/2, h/2), -angle, 1.0)
-            img_to_process = cv2.warpAffine(img_to_process, M, (w, h),
-                                       flags=cv2.INTER_LINEAR,
-                                       borderMode=cv2.BORDER_CONSTANT,
-                                       borderValue=(0,0,0))
-        img_to_process = crop_and_warp(img_to_process, np.array(override_pts, dtype=np.float32))
-    
-    # Now process img_to_process (which is either original or manually cropped/rotated)
-    # The individual pipelines (process_bw_pipeline, process_color_pipeline)
-    # contain their own rotate_and_crop logic if override_pts was NOT provided.
-    # If override_pts WAS provided, img_to_process is ALREADY cropped.
-    # The pipelines should ideally take this into account or have a flag.
-    # For now, they will re-run detection if no points are passed to crop_and_warp inside them.
-
-    if film_type == FILM_TYPE_BW_INTERNAL_KEY:
-        # If already manually cropped, pass the cropped version.
-        # The pipelines currently always call rotate_and_crop_xx(img), which then calls detectors.
-        # This needs refinement if we want to avoid re-detection on already user-cropped images.
-        # A quick fix: if override_pts, the pipeline's internal rotate_and_crop will be on an already cropped image.
-        after = process_bw_pipeline(img_to_process, low_pct=0.5, high_pct=99.5)
-    else: # Color
-        after = process_color_pipeline(img_to_process, low_pct=0.5, high_pct=99.5)
-        
-    return before, after  # 'before' is always the original loaded image for comparison
+    override_pts = _lookup_override_points(in_path)
+    after = _process_loaded_image(
+        before,
+        in_path,
+        film_type,
+        low_pct=0.5,
+        high_pct=99.5,
+        override_pts=override_pts,
+    )
+    return before, after
 
 
 def _apply_crop_editor(
@@ -676,8 +934,8 @@ def _apply_crop_editor(
     bl = (left, h_img - 1 - bottom)
 
     new_pts_ordered = order_points(np.array([tl, tr, br, bl], dtype=np.float32))
-    user_crops[path] = [(float(x), float(y)) for x, y in new_pts_ordered]
-    user_angles[path] = float(angle)
+    pts_for_storage = [(float(x), float(y)) for x, y in new_pts_ordered]
+    _store_user_override(path, pts_for_storage, angle)
 
     return _preview_images(path, film_type)
 
@@ -688,8 +946,8 @@ def get_manual_crop_settings(path: str) -> tuple[dict[str, float], float]:
     The margins are given as pixel offsets from each edge of the original image.
     """
 
-    stored_pts = user_crops.get(path)
-    angle = user_angles.get(path, 0.0)
+    stored_pts = _lookup_override_points(path)
+    angle = _lookup_override_angle(path)
     if not stored_pts:
         return {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}, angle
 
@@ -711,7 +969,7 @@ def get_manual_crop_settings(path: str) -> tuple[dict[str, float], float]:
 
 
 
-def _process_path(in_path: str, out_path: str, film_type: str, recurse: bool = False, crop_dict: dict | None = None):
+def _process_path(in_path: str, out_path: str, film_type: str, recurse: bool = False):
     if os.path.isfile(in_path):
         if os.path.isdir(out_path): # If output is a dir, create filename inside
             stem = Path(in_path).stem + "_out" # Suffix added by save_image
@@ -720,7 +978,7 @@ def _process_path(in_path: str, out_path: str, film_type: str, recurse: bool = F
             out_file_path = out_path
         Path(out_file_path).parent.mkdir(parents=True, exist_ok=True) # Ensure dir for file exists
         logging.info(f"Processing: {in_path} → {out_file_path}.png")
-        rt_auto_cast_removal(in_path, out_file_path, film_type, override_pts=crop_dict.get(in_path) if crop_dict else None)
+        rt_auto_cast_removal(in_path, out_file_path, film_type)
     elif os.path.isdir(in_path):
         os.makedirs(out_path, exist_ok=True)
         for root, _, files in os.walk(in_path):
@@ -730,7 +988,7 @@ def _process_path(in_path: str, out_path: str, film_type: str, recurse: bool = F
                     dst_stem = Path(name).stem + "_out"
                     dst = os.path.join(out_path, dst_stem) # save_image will add .png
                     logging.info(f"Processing: {src} → {dst}.png")
-                    rt_auto_cast_removal(src, dst, film_type, override_pts=crop_dict.get(src) if crop_dict else None)
+                    rt_auto_cast_removal(src, dst, film_type)
             if not recurse: # Process only top-level directory if not recursing
                 break
     else:
@@ -743,10 +1001,11 @@ def launch_qt_ui() -> None:
     api = ProcessingAPI(
         preview_images=_preview_images,
         process_path=_process_path,
-        apply_crop_editor=_apply_crop_editor,
-        get_crop_settings=get_manual_crop_settings,
-        user_crops=user_crops,
-        user_angles=user_angles,
+        set_adjustments=set_adjustments,
+        get_adjustments=get_adjustments,
+        set_manual_crop_points=set_manual_crop_points,
+        get_manual_crop_points=get_manual_crop_points,
+        clear_manual_crop=clear_manual_crop,
         allowed_extensions=ALLOWED_EXTS,
     )
     run_qt_app(api)
@@ -768,6 +1027,3 @@ if __name__ == '__main__':
         _process_path(cli_input_path, cli_output_path, cli_film_type, recurse=os.path.isdir(cli_input_path))
     else:
         launch_qt_ui()
-
-
-
