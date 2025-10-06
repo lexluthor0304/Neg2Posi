@@ -475,15 +475,22 @@ class MainWindow(QtWidgets.QMainWindow):
         titles_layout.addWidget(self.after_label)
         right_layout.addLayout(titles_layout)
 
-        preview_layout = QtWidgets.QHBoxLayout()
+        self.compare_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.compare_splitter.setChildrenCollapsible(False)
         self.before_image_view = CropPreview()
         self.before_image_view.set_interactive(True)
         self.after_image_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
         self.after_image_label.setMinimumSize(200, 200)
         self.after_image_label.setFrameShape(QtWidgets.QFrame.Box)
-        preview_layout.addWidget(self.before_image_view, 1)
-        preview_layout.addWidget(self.after_image_label, 1)
-        right_layout.addLayout(preview_layout)
+        self.after_image_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        self.compare_splitter.addWidget(self.before_image_view)
+        self.compare_splitter.addWidget(self.after_image_label)
+        self.compare_splitter.setStretchFactor(0, 1)
+        self.compare_splitter.setStretchFactor(1, 1)
+        right_layout.addWidget(self.compare_splitter, 1)
 
         # Signal connections
         self.select_file_btn.clicked.connect(self._choose_file)
