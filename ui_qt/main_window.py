@@ -2,12 +2,213 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+_RESOURCE_BASES = []
+if hasattr(sys, "_MEIPASS"):
+    _RESOURCE_BASES.append(Path(sys._MEIPASS))
+_RESOURCE_BASES.append(Path(__file__).resolve().parents[1])
+
+
+_I18N_SEARCH_PATHS = [
+    base / "resources" / subdir
+    for base in _RESOURCE_BASES
+    for subdir in ("i18n", "languages")
+]
+
+
+_LANGUAGE_ALIASES: Dict[str, str] = {
+    "default": "en",
+    "en-us": "en",
+    "en_us": "en",
+    "en-gb": "en",
+    "zh-cn": "zh",
+    "zh_cn": "zh",
+    "zh-hans": "zh",
+    "zh-hant": "zh",
+    "zh-tw": "zh",
+    "ja-jp": "ja",
+    "ja_jp": "ja",
+}
+
+
+_EMBEDDED_TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "en": {
+        "input_label": "Input:",
+        "output_label": "Output Directory:",
+        "select_file": "Select File",
+        "select_folder": "Select Folder",
+        "choose_output": "Choose Output Dir",
+        "preview": "Preview",
+        "process": "Process",
+        "status_default": "Preview will appear here.",
+        "film_type_label": "Processing Mode:",
+        "film_type_color": "Color Negative",
+        "film_type_bw": "B&W Negative",
+        "left_panel_header": "Controls",
+        "right_panel_header": "Preview Area",
+        "step1_header": "Step 1 > Choose Negatives",
+        "step2_header": "Step 2 > Pick Save Location",
+        "step3_header": "Step 3 > Preview & Convert",
+        "adjustments_group": "Adjustments",
+        "label_brightness": "Brightness",
+        "label_cyan": "Cyan",
+        "label_magenta": "Magenta",
+        "label_yellow": "Yellow",
+        "adjustments_reset": "Reset",
+        "status_no_images": "No supported image files found.",
+        "status_preview_generated": "Preview generated for {} image(s).",
+        "status_processing": "Processing...",
+        "status_completed": "✔ Completed conversion.",
+        "status_error": "✘ Error: {}",
+        "banner_welcome": "Welcome! Follow these 4 quick steps:",
+        "banner_step1": "1. Choose your film negative file *or* a folder containing scans.",
+        "banner_step2": "2. Select where to save the converted positives.",
+        "banner_step3": "3. Click **Preview** to check the result.",
+        "banner_step4": "4. Click **Process** to complete the conversion.",
+        "tooltip_lang_combo": "Change the interface language.",
+        "tooltip_select_file": "Pick a single scan (JPEG/PNG/TIFF/RAW).",
+        "tooltip_select_folder": "Pick a folder to process all supported images inside.",
+        "tooltip_choose_output": "Choose the folder where the converted positives will be saved.",
+        "tooltip_preview_btn": "Shows a quick before/after view without saving any files.",
+        "tooltip_process_btn": "Runs the full conversion and writes the results to disk.",
+        "menu_language": "Language",
+        "menu_language_english": "English",
+        "menu_language_chinese": "中文",
+        "menu_language_japanese": "日本語",
+        "status_ready": "Ready.",
+        "status_processing_complete": "Processing finished.",
+        "status_processing_failed": "Processing failed: {}",
+        "status_preview_failed": "Preview failed: {}",
+        "dialog_open_file": "Select negative",
+        "dialog_open_folder": "Select folder",
+        "dialog_open_output": "Select output directory",
+        "label_before": "Before",
+        "label_after": "After",
+    },
+    "zh": {
+        "input_label": "输入：",
+        "output_label": "输出目录：",
+        "select_file": "选择文件",
+        "select_folder": "选择文件夹",
+        "choose_output": "选择输出目录",
+        "preview": "预览",
+        "process": "处理",
+        "status_default": "预览会显示在此处。",
+        "film_type_label": "处理模式：",
+        "film_type_color": "彩色负片",
+        "film_type_bw": "黑白负片",
+        "left_panel_header": "控制",
+        "right_panel_header": "预览区域",
+        "step1_header": "步骤 1 > 选择底片",
+        "step2_header": "步骤 2 > 选择保存位置",
+        "step3_header": "步骤 3 > 预览并转换",
+        "adjustments_group": "色彩调整",
+        "label_brightness": "亮度",
+        "label_cyan": "青色",
+        "label_magenta": "洋红",
+        "label_yellow": "黄色",
+        "adjustments_reset": "重置",
+        "status_no_images": "未找到受支持的图像文件。",
+        "status_preview_generated": "已生成 {} 张图像的预览。",
+        "status_processing": "处理中…",
+        "status_completed": "✔ 转换完成。",
+        "status_error": "✘ 错误：{}",
+        "banner_welcome": "欢迎！请按照以下四个步骤操作：",
+        "banner_step1": "1. 选择单个底片文件或包含扫描件的文件夹。",
+        "banner_step2": "2. 选择保存转换后正片的位置。",
+        "banner_step3": "3. 点击“预览”查看效果。",
+        "banner_step4": "4. 点击“处理”完成转换。",
+        "tooltip_lang_combo": "切换界面语言。",
+        "tooltip_select_file": "选择一个扫描文件 (JPEG/PNG/TIFF/RAW)。",
+        "tooltip_select_folder": "选择一个文件夹以处理其中所有受支持的图像。",
+        "tooltip_choose_output": "选择保存转换后图像的文件夹。",
+        "tooltip_preview_btn": "快速查看前后效果，不会保存文件。",
+        "tooltip_process_btn": "执行完整转换并将结果写入磁盘。",
+        "menu_language": "语言",
+        "menu_language_english": "English",
+        "menu_language_chinese": "中文",
+        "menu_language_japanese": "日本語",
+        "status_ready": "就绪。",
+        "status_processing_complete": "处理完成。",
+        "status_processing_failed": "处理失败：{}",
+        "status_preview_failed": "预览失败：{}",
+        "dialog_open_file": "选择底片",
+        "dialog_open_folder": "选择文件夹",
+        "dialog_open_output": "选择输出目录",
+        "label_before": "处理前",
+        "label_after": "处理后",
+    },
+    "ja": {
+        "input_label": "入力：",
+        "output_label": "出力フォルダー：",
+        "select_file": "ファイルを選択",
+        "select_folder": "フォルダーを選択",
+        "choose_output": "出力先を選択",
+        "preview": "プレビュー",
+        "process": "変換",
+        "status_default": "ここにプレビューが表示されます。",
+        "film_type_label": "処理モード：",
+        "film_type_color": "カラーネガ",
+        "film_type_bw": "白黒ネガ",
+        "left_panel_header": "操作",
+        "right_panel_header": "プレビュー",
+        "step1_header": "ステップ1 > ネガを選ぶ",
+        "step2_header": "ステップ2 > 保存先を選ぶ",
+        "step3_header": "ステップ3 > プレビューと変換",
+        "adjustments_group": "色調調整",
+        "label_brightness": "明るさ",
+        "label_cyan": "シアン",
+        "label_magenta": "マゼンタ",
+        "label_yellow": "イエロー",
+        "adjustments_reset": "リセット",
+        "status_no_images": "対応する画像ファイルが見つかりません。",
+        "status_preview_generated": "{} 件のプレビューを生成しました。",
+        "status_processing": "処理中…",
+        "status_completed": "✔ 変換が完了しました。",
+        "status_error": "✘ エラー：{}",
+        "banner_welcome": "ようこそ！次の4ステップで操作してください：",
+        "banner_step1": "1. 単一のネガファイルまたはスキャンを含むフォルダーを選択します。",
+        "banner_step2": "2. 変換後のポジを保存する場所を選択します。",
+        "banner_step3": "3. 「プレビュー」をクリックして結果を確認します。",
+        "banner_step4": "4. 「変換」をクリックして処理を完了します。",
+        "tooltip_lang_combo": "UIの言語を変更します。",
+        "tooltip_select_file": "スキャンファイル (JPEG/PNG/TIFF/RAW) を選択します。",
+        "tooltip_select_folder": "対応画像を処理するフォルダーを選択します。",
+        "tooltip_choose_output": "変換結果を保存するフォルダーを選択します。",
+        "tooltip_preview_btn": "ファイルを保存せずに前後比較を表示します。",
+        "tooltip_process_btn": "フル変換を実行し、結果をディスクに保存します。",
+        "menu_language": "言語",
+        "menu_language_english": "English",
+        "menu_language_chinese": "中文",
+        "menu_language_japanese": "日本語",
+        "status_ready": "待機中。",
+        "status_processing_complete": "処理が完了しました。",
+        "status_processing_failed": "処理に失敗しました: {}",
+        "status_preview_failed": "プレビューに失敗しました: {}",
+        "dialog_open_file": "ネガを選択",
+        "dialog_open_folder": "フォルダーを選択",
+        "dialog_open_output": "出力フォルダーを選択",
+        "label_before": "処理前",
+        "label_after": "処理後",
+    },
+}
+
+
+def _normalize_language_code(code: str) -> str:
+    normalized = (code or "en").strip().lower()
+    return _LANGUAGE_ALIASES.get(normalized, normalized or "en")
 
 
 @dataclass
@@ -23,13 +224,24 @@ class ProcessingAPI:
     allowed_extensions: Tuple[str, ...]
 
 
-I18N_DIR = Path(__file__).resolve().parents[1] / "resources" / "i18n"
-
-
 def _load_language_file(code: str) -> Dict[str, str]:
-    path = I18N_DIR / f"{code}.json"
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
+    normalized = _normalize_language_code(code)
+    for directory in _I18N_SEARCH_PATHS:
+        path = directory / f"{normalized}.json"
+        if path.is_file():
+            with path.open(encoding="utf-8") as f:
+                return json.load(f)
+    embedded = _EMBEDDED_TRANSLATIONS.get(normalized)
+    if embedded is not None:
+        _LOGGER.warning(
+            "Translation file '%s.json' not found on disk; using embedded fallback.",
+            normalized,
+        )
+        return dict(embedded)
+    searched = ", ".join(str(p) for p in _I18N_SEARCH_PATHS)
+    raise FileNotFoundError(
+        f"Translation file '{normalized}.json' not found in any known location: {searched}"
+    )
 
 
 def numpy_to_qpixmap(arr: np.ndarray) -> QtGui.QPixmap:
@@ -317,18 +529,23 @@ class MainWindow(QtWidgets.QMainWindow):
     # Translation helpers
     # ------------------------------------------------------------------
     def _load_translations(self, code: str) -> None:
+        normalized = _normalize_language_code(code)
         base = _load_language_file("en")
-        if code == "en":
+        if normalized == "en":
             self.translations = base
         else:
             try:
-                override = _load_language_file(code)
+                override = _load_language_file(normalized)
             except FileNotFoundError:
+                _LOGGER.warning(
+                    "Translation for '%s' not found; falling back to English.",
+                    normalized,
+                )
                 override = {}
             merged = base.copy()
             merged.update(override)
             self.translations = merged
-        self.current_language = code
+        self.current_language = normalized
 
     def _t(self, key: str, fallback: str = "") -> str:
         return self.translations.get(key, fallback)
@@ -517,10 +734,11 @@ class MainWindow(QtWidgets.QMainWindow):
     # Event handlers
     # ------------------------------------------------------------------
     def _switch_language(self, code: str) -> None:
-        if code == self.current_language:
+        normalized = _normalize_language_code(code)
+        if normalized == self.current_language:
             return
         try:
-            self._load_translations(code)
+            self._load_translations(normalized)
         except FileNotFoundError:
             self._load_translations("en")
         self._apply_translations()
