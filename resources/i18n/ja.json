@@ -20,6 +20,8 @@
   "label_cyan": "シアン",
   "label_magenta": "マゼンタ",
   "label_yellow": "イエロー",
+  "label_temperature": "色温度",
+  "label_tint": "ティント",
   "adjustments_reset": "リセット",
   "status_no_images": "対応する画像ファイルが見つかりません。",
   "status_preview_generated": "{} 件のプレビューを生成しました。",

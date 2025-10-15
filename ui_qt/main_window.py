@@ -66,6 +66,8 @@ _EMBEDDED_TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "label_cyan": "Cyan",
         "label_magenta": "Magenta",
         "label_yellow": "Yellow",
+        "label_temperature": "Temperature",
+        "label_tint": "Tint",
         "adjustments_reset": "Reset",
         "status_no_images": "No supported image files found.",
         "status_preview_generated": "Preview generated for {} image(s).",
@@ -119,6 +121,8 @@ _EMBEDDED_TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "label_cyan": "青色",
         "label_magenta": "洋红",
         "label_yellow": "黄色",
+        "label_temperature": "色温",
+        "label_tint": "色调",
         "adjustments_reset": "重置",
         "status_no_images": "未找到受支持的图像文件。",
         "status_preview_generated": "已生成 {} 张图像的预览。",
@@ -172,6 +176,8 @@ _EMBEDDED_TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "label_cyan": "シアン",
         "label_magenta": "マゼンタ",
         "label_yellow": "イエロー",
+        "label_temperature": "色温度",
+        "label_tint": "ティント",
         "adjustments_reset": "リセット",
         "status_no_images": "対応する画像ファイルが見つかりません。",
         "status_preview_generated": "{} 件のプレビューを生成しました。",
@@ -215,8 +221,9 @@ def _normalize_language_code(code: str) -> str:
 class ProcessingAPI:
     preview_images: Callable[[str, str], Tuple[np.ndarray, np.ndarray]]
     process_path: Callable[[str, str, str, bool], None]
-    set_adjustments: Callable[[float, float, float, float], None]
-    get_adjustments: Callable[[], Tuple[float, float, float, float]]
+    set_adjustments: Callable[[float, float, float, float, float, float], None]
+    get_adjustments: Callable[[], Tuple[float, float, float, float, float, float]]
+    get_preview_core_image: Callable[[str, str], np.ndarray]
     set_manual_crop_points: Callable[[str, Iterable[Tuple[float, float]], float], None]
     get_manual_crop_points: Callable[[str], Optional[List[Tuple[float, float]]]]
     clear_manual_crop: Callable[[str], None]
@@ -507,6 +514,72 @@ class CropPreview(QtWidgets.QFrame):
         return QtCore.QPointF(float(event.x()), float(event.y()))
 
 
+class AfterImageLabel(QtWidgets.QLabel):
+    """Display the processed preview and emit clicks for white-balance sampling."""
+
+    whiteBalancePickRequested = QtCore.Signal(float, float)
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setMinimumSize(200, 200)
+        self.setFrameShape(QtWidgets.QFrame.Box)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        self.setCursor(QtCore.Qt.CrossCursor)
+        self._source_pixmap = QtGui.QPixmap()
+        self._scaled_pixmap = QtGui.QPixmap()
+
+    def clear_image(self) -> None:
+        self._source_pixmap = QtGui.QPixmap()
+        self._scaled_pixmap = QtGui.QPixmap()
+        self.clear()
+
+    def set_source_pixmap(self, pixmap: QtGui.QPixmap) -> None:
+        self._source_pixmap = pixmap
+        self._update_scaled_pixmap()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: D401, N802
+        super().resizeEvent(event)
+        if not self._source_pixmap.isNull():
+            self._update_scaled_pixmap()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: D401, N802
+        if event.button() != QtCore.Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        if self._source_pixmap.isNull() or self._scaled_pixmap.isNull():
+            return
+        pos = (
+            event.position() if hasattr(event, "position") else QtCore.QPointF(event.x(), event.y())
+        )
+        scaled_size = self._scaled_pixmap.size()
+        if scaled_size.isEmpty():
+            return
+        offset_x = (self.width() - scaled_size.width()) / 2.0
+        offset_y = (self.height() - scaled_size.height()) / 2.0
+        x = pos.x() - offset_x
+        y = pos.y() - offset_y
+        if x < 0.0 or y < 0.0 or x >= scaled_size.width() or y >= scaled_size.height():
+            return
+        scale_x = self._source_pixmap.width() / max(1.0, float(scaled_size.width()))
+        scale_y = self._source_pixmap.height() / max(1.0, float(scaled_size.height()))
+        self.whiteBalancePickRequested.emit(x * scale_x, y * scale_y)
+
+    def _update_scaled_pixmap(self) -> None:
+        if self._source_pixmap.isNull() or self.width() <= 0 or self.height() <= 0:
+            self._scaled_pixmap = QtGui.QPixmap()
+            self.clear()
+            return
+        scaled = self._source_pixmap.scaled(
+            self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+        )
+        self._scaled_pixmap = scaled
+        self.setPixmap(scaled)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, api: ProcessingAPI) -> None:
         super().__init__()
@@ -638,6 +711,8 @@ class MainWindow(QtWidgets.QMainWindow):
         adjustments_layout = QtWidgets.QGridLayout(self.adjustments_group)
         self._adjustment_label_keys = {
             "brightness": "label_brightness",
+            "temperature": "label_temperature",
+            "tint": "label_tint",
             "cyan": "label_cyan",
             "magenta": "label_magenta",
             "yellow": "label_yellow",
@@ -647,6 +722,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.adjustment_spinboxes: Dict[str, QtWidgets.QSpinBox] = {}
         specs = [
             ("brightness", -100, 100),
+            ("temperature", -200, 200),
+            ("tint", -200, 200),
             ("cyan", -100, 100),
             ("magenta", -100, 100),
             ("yellow", -100, 100),
@@ -696,13 +773,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.compare_splitter.setChildrenCollapsible(False)
         self.before_image_view = CropPreview()
         self.before_image_view.set_interactive(True)
-        self.after_image_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
-        self.after_image_label.setMinimumSize(200, 200)
-        self.after_image_label.setFrameShape(QtWidgets.QFrame.Box)
-        self.after_image_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Expanding,
-        )
+        self.after_image_label = AfterImageLabel()
         self.compare_splitter.addWidget(self.before_image_view)
         self.compare_splitter.addWidget(self.after_image_label)
         self.compare_splitter.setStretchFactor(0, 1)
@@ -717,6 +788,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.process_btn.clicked.connect(self._handle_process)
         self.adjustments_reset_btn.clicked.connect(self._reset_adjustments)
         self.before_image_view.cropChanged.connect(self._handle_manual_crop_rect)
+        self.after_image_label.whiteBalancePickRequested.connect(
+            self._handle_after_white_balance_pick
+        )
 
     def _create_menus(self) -> None:
         menu = self.menuBar().addMenu("")
@@ -818,16 +892,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_after_label(self) -> None:
         if self.last_after_image is None:
-            self.after_image_label.clear()
+            self.after_image_label.clear_image()
             return
         after_pixmap = numpy_to_qpixmap(self.last_after_image)
-        self.after_image_label.setPixmap(
-            after_pixmap.scaled(
-                self.after_image_label.size(),
-                QtCore.Qt.KeepAspectRatio,
-                QtCore.Qt.SmoothTransformation,
-            )
-        )
+        self.after_image_label.set_source_pixmap(after_pixmap)
 
     def _current_crop_rect(self) -> QtCore.QRectF:
         if self.last_before_image is None:
@@ -880,6 +948,61 @@ class MainWindow(QtWidgets.QMainWindow):
             self._t("status_preview_generated", "Preview generated for {} image(s)." ).format(1)
         )
 
+    def _handle_after_white_balance_pick(self, x: float, y: float) -> None:
+        if self.current_preview_path is None:
+            return
+        try:
+            core_image = self.api.get_preview_core_image(
+                self.current_preview_path,
+                self._selected_film_type(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.status_label.setText(
+                self._t("status_preview_failed", "Preview failed: {}" ).format(exc)
+            )
+            return
+        if core_image is None or core_image.ndim < 3 or core_image.shape[2] < 3:
+            return
+        height, width = core_image.shape[:2]
+        if height == 0 or width == 0:
+            return
+        xi = int(np.clip(round(x), 0, width - 1))
+        yi = int(np.clip(round(y), 0, height - 1))
+        radius = 2
+        x0 = max(0, xi - radius)
+        x1 = min(width, xi + radius + 1)
+        y0 = max(0, yi - radius)
+        y1 = min(height, yi + radius + 1)
+        patch = core_image[y0:y1, x0:x1]
+        if patch.size == 0:
+            return
+        rgb = patch.reshape(-1, patch.shape[-1]).mean(axis=0)
+        if rgb.shape[0] < 3:
+            return
+        eps = 1e-6
+        r = float(max(rgb[0], eps))
+        g = float(max(rgb[1], eps))
+        b = float(max(rgb[2], eps))
+        temp_value = 0.5 * float(np.log2(b / r))
+        tint_value = (temp_value - float(np.log2(g / r))) / 1.5
+        temp_value = float(np.clip(temp_value, -2.0, 2.0))
+        tint_value = float(np.clip(tint_value, -2.0, 2.0))
+        self._adjustment_sync_in_progress = True
+        try:
+            for key, value in {"temperature": temp_value, "tint": tint_value}.items():
+                slider = self.adjustment_sliders[key]
+                spin = self.adjustment_spinboxes[key]
+                int_value = int(round(value * 100))
+                slider.blockSignals(True)
+                slider.setValue(int_value)
+                slider.blockSignals(False)
+                spin.blockSignals(True)
+                spin.setValue(int_value)
+                spin.blockSignals(False)
+        finally:
+            self._adjustment_sync_in_progress = False
+        self._handle_adjustment_change()
+
     def _on_adjustment_slider_changed(self, key: str, value: int) -> None:
         spin = self.adjustment_spinboxes[key]
         if spin.value() != value:
@@ -900,10 +1023,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._adjustment_sync_in_progress:
             return
         brightness = self.adjustment_sliders["brightness"].value() / 100.0
+        temperature = self.adjustment_sliders["temperature"].value() / 100.0
+        tint = self.adjustment_sliders["tint"].value() / 100.0
         cyan = self.adjustment_sliders["cyan"].value() / 100.0
         magenta = self.adjustment_sliders["magenta"].value() / 100.0
         yellow = self.adjustment_sliders["yellow"].value() / 100.0
-        self.api.set_adjustments(brightness, cyan, magenta, yellow)
+        self.api.set_adjustments(brightness, cyan, magenta, yellow, temperature, tint)
         if self.current_preview_path is None:
             return
         try:
@@ -925,12 +1050,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._handle_adjustment_change()
 
     def _load_initial_adjustments(self) -> None:
-        brightness, cyan, magenta, yellow = self.api.get_adjustments()
+        brightness, cyan, magenta, yellow, temperature, tint = self.api.get_adjustments()
         values = {
             "brightness": int(round(brightness * 100)),
             "cyan": int(round(cyan * 100)),
             "magenta": int(round(magenta * 100)),
             "yellow": int(round(yellow * 100)),
+            "temperature": int(round(temperature * 100)),
+            "tint": int(round(tint * 100)),
         }
         self._adjustment_sync_in_progress = True
         try:
