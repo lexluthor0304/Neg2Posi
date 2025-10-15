@@ -148,6 +148,8 @@ class AdjustmentState:
     cyan: float = 0.0
     magenta: float = 0.0
     yellow: float = 0.0
+    temperature: float = 0.0
+    tint: float = 0.0
 
 
 _current_adjustments = AdjustmentState()
@@ -165,20 +167,36 @@ _preview_cache: dict[tuple[str, str, str], PreviewCacheEntry] = {}
 _preview_cache_lock = threading.Lock()
 
 
-def set_adjustments(brightness: float, cyan: float, magenta: float, yellow: float) -> None:
+def set_adjustments(
+    brightness: float,
+    cyan: float,
+    magenta: float,
+    yellow: float,
+    temperature: float,
+    tint: float,
+) -> None:
     """Update global tone adjustment settings."""
 
     _current_adjustments.brightness = float(brightness)
     _current_adjustments.cyan = float(cyan)
     _current_adjustments.magenta = float(magenta)
     _current_adjustments.yellow = float(yellow)
+    _current_adjustments.temperature = float(temperature)
+    _current_adjustments.tint = float(tint)
 
 
-def get_adjustments() -> tuple[float, float, float, float]:
+def get_adjustments() -> tuple[float, float, float, float, float, float]:
     """Return the current tone adjustment settings as a tuple."""
 
     adj = _current_adjustments
-    return adj.brightness, adj.cyan, adj.magenta, adj.yellow
+    return (
+        adj.brightness,
+        adj.cyan,
+        adj.magenta,
+        adj.yellow,
+        adj.temperature,
+        adj.tint,
+    )
 
 
 def _preview_override_signature(
@@ -514,12 +532,27 @@ def _apply_tone_adjustments(img: np.ndarray) -> np.ndarray:
     """Apply brightness and CMY adjustments to *img* in-place-safe manner."""
 
     adj = _current_adjustments
-    if not any((adj.brightness, adj.cyan, adj.magenta, adj.yellow)):
+    if not any(
+        (
+            adj.brightness,
+            adj.cyan,
+            adj.magenta,
+            adj.yellow,
+            adj.temperature,
+            adj.tint,
+        )
+    ):
         return np.clip(img, 0.0, 1.0)
     out = img.astype(np.float32, copy=True)
     if adj.brightness:
         out += adj.brightness
     if out.ndim == 3 and out.shape[2] >= 3:
+        if adj.temperature or adj.tint:
+            red_gain = 2.0 ** (adj.temperature - adj.tint / 2.0)
+            green_gain = 2.0 ** adj.tint
+            blue_gain = 2.0 ** (-adj.temperature - adj.tint / 2.0)
+            gains = np.array([red_gain, green_gain, blue_gain], dtype=np.float32)
+            out *= gains
         if adj.cyan:
             out[..., 0] -= adj.cyan
         if adj.magenta:
@@ -1011,6 +1044,20 @@ def _preview_images(in_path: str, film_type: str):
     return entry.before, after
 
 
+def _get_preview_core_image(in_path: str, film_type: str) -> np.ndarray:
+    """Return the cached core preview (before tone adjustments)."""
+
+    override_pts = _lookup_override_points(in_path)
+    entry = _get_or_create_preview_entry(
+        in_path,
+        film_type,
+        override_pts=override_pts,
+        low_pct=0.5,
+        high_pct=99.5,
+    )
+    return np.array(entry.intermediate, dtype=np.float32, copy=True)
+
+
 def _apply_crop_editor(
     path: str,
     margins: dict[str, float],
@@ -1118,6 +1165,7 @@ def launch_qt_ui() -> None:
         process_path=_process_path,
         set_adjustments=set_adjustments,
         get_adjustments=get_adjustments,
+        get_preview_core_image=_get_preview_core_image,
         set_manual_crop_points=set_manual_crop_points,
         get_manual_crop_points=get_manual_crop_points,
         clear_manual_crop=clear_manual_crop,

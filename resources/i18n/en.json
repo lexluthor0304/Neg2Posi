@@ -20,6 +20,8 @@
   "label_cyan": "Cyan",
   "label_magenta": "Magenta",
   "label_yellow": "Yellow",
+  "label_temperature": "Temperature",
+  "label_tint": "Tint",
   "adjustments_reset": "Reset",
   "status_no_images": "No supported image files found.",
   "status_preview_generated": "Preview generated for {} image(s).",
@@ -49,5 +51,15 @@
   "dialog_open_folder": "Select folder",
   "dialog_open_output": "Select output directory",
   "label_before": "Before",
-  "label_after": "After"
+  "label_after": "After",
+  "white_balance_button": "White Balance…",
+  "white_balance_dialog_title": "White Balance Adjustment",
+  "white_balance_instructions": "Click the eyedropper over a neutral part of the preview to adjust white balance.",
+  "white_balance_status_initial": "No sample selected.",
+  "white_balance_status_values": "Temperature: {:+.2f}, Tint: {:+.2f}",
+  "white_balance_status_invalid": "Could not sample at that location. Try again.",
+  "white_balance_close": "Close",
+  "white_balance_no_preview": "Generate a preview before adjusting white balance.",
+  "white_balance_unavailable": "White balance sampling is unavailable for this preview.",
+  "white_balance_applied_status": "White balance updated from sample."
 }
