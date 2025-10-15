@@ -20,6 +20,8 @@
   "label_cyan": "Cyan",
   "label_magenta": "Magenta",
   "label_yellow": "Yellow",
+  "label_temperature": "Temperature",
+  "label_tint": "Tint",
   "adjustments_reset": "Reset",
   "status_no_images": "No supported image files found.",
   "status_preview_generated": "Preview generated for {} image(s).",
