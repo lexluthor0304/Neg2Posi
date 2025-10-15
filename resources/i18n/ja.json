@@ -51,15 +51,5 @@
   "dialog_open_folder": "フォルダーを選択",
   "dialog_open_output": "出力フォルダーを選択",
   "label_before": "処理前",
-  "label_after": "処理後",
-  "white_balance_button": "ホワイトバランス…",
-  "white_balance_dialog_title": "ホワイトバランス調整",
-  "white_balance_instructions": "スポイトを使ってプレビューのニュートラルな部分をクリックし、ホワイトバランスを調整します。",
-  "white_balance_status_initial": "サンプルが選択されていません。",
-  "white_balance_status_values": "色温度: {:+.2f}、ティント: {:+.2f}",
-  "white_balance_status_invalid": "その位置ではサンプルを取得できません。もう一度お試しください。",
-  "white_balance_close": "閉じる",
-  "white_balance_no_preview": "ホワイトバランスを調整する前にプレビューを生成してください。",
-  "white_balance_unavailable": "このプレビューではホワイトバランスのサンプリングを使用できません。",
-  "white_balance_applied_status": "サンプルからホワイトバランスを更新しました。"
+  "label_after": "処理後"
 }

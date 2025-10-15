@@ -51,15 +51,5 @@
   "dialog_open_folder": "选择文件夹",
   "dialog_open_output": "选择输出目录",
   "label_before": "处理前",
-  "label_after": "处理后",
-  "white_balance_button": "白平衡…",
-  "white_balance_dialog_title": "白平衡调整",
-  "white_balance_instructions": "点击取色器在预览中选择中性区域以调整白平衡。",
-  "white_balance_status_initial": "尚未选择样本。",
-  "white_balance_status_values": "色温：{:+.2f}，色调：{:+.2f}",
-  "white_balance_status_invalid": "无法在该位置取样，请重试。",
-  "white_balance_close": "关闭",
-  "white_balance_no_preview": "请先生成预览，再进行白平衡调整。",
-  "white_balance_unavailable": "当前预览无法进行白平衡取样。",
-  "white_balance_applied_status": "已根据样本更新白平衡。"
+  "label_after": "处理后"
 }

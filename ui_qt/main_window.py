@@ -98,16 +98,6 @@ _EMBEDDED_TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "dialog_open_output": "Select output directory",
         "label_before": "Before",
         "label_after": "After",
-        "white_balance_button": "White Balance…",
-        "white_balance_dialog_title": "White Balance Adjustment",
-        "white_balance_instructions": "Click the eyedropper over a neutral part of the preview to adjust white balance.",
-        "white_balance_status_initial": "No sample selected.",
-        "white_balance_status_values": "Temperature: {:+.2f}, Tint: {:+.2f}",
-        "white_balance_status_invalid": "Could not sample at that location. Try again.",
-        "white_balance_close": "Close",
-        "white_balance_no_preview": "Generate a preview before adjusting white balance.",
-        "white_balance_unavailable": "White balance sampling is unavailable for this preview.",
-        "white_balance_applied_status": "White balance updated from sample.",
     },
     "zh": {
         "input_label": "输入：",
@@ -163,16 +153,6 @@ _EMBEDDED_TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "dialog_open_output": "选择输出目录",
         "label_before": "处理前",
         "label_after": "处理后",
-        "white_balance_button": "白平衡…",
-        "white_balance_dialog_title": "白平衡调整",
-        "white_balance_instructions": "点击取色器在预览中选择中性区域以调整白平衡。",
-        "white_balance_status_initial": "尚未选择样本。",
-        "white_balance_status_values": "色温：{:+.2f}，色调：{:+.2f}",
-        "white_balance_status_invalid": "无法在该位置取样，请重试。",
-        "white_balance_close": "关闭",
-        "white_balance_no_preview": "请先生成预览，再进行白平衡调整。",
-        "white_balance_unavailable": "当前预览无法进行白平衡取样。",
-        "white_balance_applied_status": "已根据样本更新白平衡。",
     },
     "ja": {
         "input_label": "入力：",
@@ -228,16 +208,6 @@ _EMBEDDED_TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "dialog_open_output": "出力フォルダーを選択",
         "label_before": "処理前",
         "label_after": "処理後",
-        "white_balance_button": "ホワイトバランス…",
-        "white_balance_dialog_title": "ホワイトバランス調整",
-        "white_balance_instructions": "スポイトを使ってプレビューのニュートラルな部分をクリックし、ホワイトバランスを調整します。",
-        "white_balance_status_initial": "サンプルが選択されていません。",
-        "white_balance_status_values": "色温度: {:+.2f}、ティント: {:+.2f}",
-        "white_balance_status_invalid": "その位置ではサンプルを取得できません。もう一度お試しください。",
-        "white_balance_close": "閉じる",
-        "white_balance_no_preview": "ホワイトバランスを調整する前にプレビューを生成してください。",
-        "white_balance_unavailable": "このプレビューではホワイトバランスのサンプリングを使用できません。",
-        "white_balance_applied_status": "サンプルからホワイトバランスを更新しました。",
     },
 }
 
@@ -544,8 +514,10 @@ class CropPreview(QtWidgets.QFrame):
         return QtCore.QPointF(float(event.x()), float(event.y()))
 
 
-class ScaledImageLabel(QtWidgets.QLabel):
-    """Display an image pixmap while keeping aspect ratio on resize."""
+class AfterImageLabel(QtWidgets.QLabel):
+    """Display the processed preview and emit clicks for white-balance sampling."""
+
+    whiteBalancePickRequested = QtCore.Signal(float, float)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
@@ -556,6 +528,7 @@ class ScaledImageLabel(QtWidgets.QLabel):
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Expanding,
         )
+        self.setCursor(QtCore.Qt.CrossCursor)
         self._source_pixmap = QtGui.QPixmap()
         self._scaled_pixmap = QtGui.QPixmap()
 
@@ -572,27 +545,6 @@ class ScaledImageLabel(QtWidgets.QLabel):
         super().resizeEvent(event)
         if not self._source_pixmap.isNull():
             self._update_scaled_pixmap()
-
-    def _update_scaled_pixmap(self) -> None:
-        if self._source_pixmap.isNull() or self.width() <= 0 or self.height() <= 0:
-            self._scaled_pixmap = QtGui.QPixmap()
-            self.clear()
-            return
-        scaled = self._source_pixmap.scaled(
-            self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
-        )
-        self._scaled_pixmap = scaled
-        self.setPixmap(scaled)
-
-
-class WhiteBalancePickerLabel(ScaledImageLabel):
-    """Scaled image label that emits pick events for white balance sampling."""
-
-    whiteBalancePickRequested = QtCore.Signal(float, float)
-
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setCursor(QtCore.Qt.CrossCursor)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: D401, N802
         if event.button() != QtCore.Qt.LeftButton:
@@ -616,120 +568,16 @@ class WhiteBalancePickerLabel(ScaledImageLabel):
         scale_y = self._source_pixmap.height() / max(1.0, float(scaled_size.height()))
         self.whiteBalancePickRequested.emit(x * scale_x, y * scale_y)
 
-
-class WhiteBalanceDialog(QtWidgets.QDialog):
-    """Dialog that lets the user sample white balance from the preview."""
-
-    sampleSelected = QtCore.Signal(float, float)
-
-    def __init__(
-        self,
-        pixmap: QtGui.QPixmap,
-        core_image: np.ndarray,
-        translator: Callable[[str, str], str],
-        parent: Optional[QtWidgets.QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self._core_image = core_image
-        self._translator = translator
-        self._pixmap_size = pixmap.size()
-        self.setModal(True)
-        self.setWindowTitle(
-            self._translator("white_balance_dialog_title", "White Balance Adjustment")
-        )
-
-        layout = QtWidgets.QVBoxLayout(self)
-        instructions = QtWidgets.QLabel(
-            self._translator(
-                "white_balance_instructions",
-                "Click the eyedropper over a neutral part of the preview to adjust white balance.",
-            )
-        )
-        instructions.setWordWrap(True)
-        layout.addWidget(instructions)
-
-        self._image_label = WhiteBalancePickerLabel()
-        self._image_label.set_source_pixmap(pixmap)
-        layout.addWidget(self._image_label, 1)
-
-        self._status_label = QtWidgets.QLabel(
-            self._translator("white_balance_status_initial", "No sample selected.")
-        )
-        layout.addWidget(self._status_label)
-
-        button_box = QtWidgets.QDialogButtonBox()
-        close_btn = button_box.addButton(
-            self._translator("white_balance_close", "Close"),
-            QtWidgets.QDialogButtonBox.RejectRole,
-        )
-        close_btn.clicked.connect(self.reject)
-        layout.addWidget(button_box)
-
-        self._image_label.whiteBalancePickRequested.connect(self._handle_pick)
-        self.resize(600, 500)
-
-    def _handle_pick(self, x: float, y: float) -> None:
-        if self._core_image.ndim < 3 or self._core_image.shape[2] < 3:
-            self._status_label.setText(
-                self._translator(
-                    "white_balance_status_invalid",
-                    "Could not sample at that location. Try again.",
-                )
-            )
+    def _update_scaled_pixmap(self) -> None:
+        if self._source_pixmap.isNull() or self.width() <= 0 or self.height() <= 0:
+            self._scaled_pixmap = QtGui.QPixmap()
+            self.clear()
             return
-        height, width = self._core_image.shape[:2]
-        if height == 0 or width == 0:
-            self._status_label.setText(
-                self._translator(
-                    "white_balance_status_invalid",
-                    "Could not sample at that location. Try again.",
-                )
-            )
-            return
-        pix_w = max(1.0, float(self._pixmap_size.width()))
-        pix_h = max(1.0, float(self._pixmap_size.height()))
-        scaled_x = x * (width / pix_w)
-        scaled_y = y * (height / pix_h)
-        xi = int(np.clip(round(scaled_x), 0, width - 1))
-        yi = int(np.clip(round(scaled_y), 0, height - 1))
-        radius = 2
-        x0 = max(0, xi - radius)
-        x1 = min(width, xi + radius + 1)
-        y0 = max(0, yi - radius)
-        y1 = min(height, yi + radius + 1)
-        patch = self._core_image[y0:y1, x0:x1]
-        if patch.size == 0:
-            self._status_label.setText(
-                self._translator(
-                    "white_balance_status_invalid",
-                    "Could not sample at that location. Try again.",
-                )
-            )
-            return
-        rgb = patch.reshape(-1, patch.shape[-1]).mean(axis=0)
-        if rgb.shape[0] < 3:
-            self._status_label.setText(
-                self._translator(
-                    "white_balance_status_invalid",
-                    "Could not sample at that location. Try again.",
-                )
-            )
-            return
-        eps = 1e-6
-        r = float(max(rgb[0], eps))
-        g = float(max(rgb[1], eps))
-        b = float(max(rgb[2], eps))
-        temp_value = 0.5 * float(np.log2(b / r))
-        tint_value = (temp_value - float(np.log2(g / r))) / 1.5
-        temp_value = float(np.clip(temp_value, -2.0, 2.0))
-        tint_value = float(np.clip(tint_value, -2.0, 2.0))
-        self.sampleSelected.emit(temp_value, tint_value)
-        self._status_label.setText(
-            self._translator(
-                "white_balance_status_values",
-                "Temperature: {:+.2f}, Tint: {:+.2f}",
-            ).format(temp_value, tint_value)
+        scaled = self._source_pixmap.scaled(
+            self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
         )
+        self._scaled_pixmap = scaled
+        self.setPixmap(scaled)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -796,7 +644,6 @@ class MainWindow(QtWidgets.QMainWindow):
             translation_key = self._adjustment_label_keys.get(key, key)
             fallback = key.capitalize()
             label.setText(self._t(translation_key, fallback))
-        self.white_balance_btn.setText(self._t("white_balance_button", "White Balance…"))
         self.adjustments_reset_btn.setText(self._t("adjustments_reset", "Reset"))
 
         language_menu = self.menuBar().findChild(QtWidgets.QMenu, "menu_language")
@@ -899,10 +746,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.adjustment_labels[key] = label
             self.adjustment_sliders[key] = slider
             self.adjustment_spinboxes[key] = spin
-        self.white_balance_btn = QtWidgets.QPushButton()
-        adjustments_layout.addWidget(self.white_balance_btn, len(specs), 0, 1, 3)
         self.adjustments_reset_btn = QtWidgets.QPushButton()
-        adjustments_layout.addWidget(self.adjustments_reset_btn, len(specs) + 1, 0, 1, 3)
+        adjustments_layout.addWidget(self.adjustments_reset_btn, len(specs), 0, 1, 3)
         left_layout.addWidget(self.adjustments_group)
 
         self.status_label = QtWidgets.QLabel()
@@ -928,7 +773,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.compare_splitter.setChildrenCollapsible(False)
         self.before_image_view = CropPreview()
         self.before_image_view.set_interactive(True)
-        self.after_image_label = ScaledImageLabel()
+        self.after_image_label = AfterImageLabel()
         self.compare_splitter.addWidget(self.before_image_view)
         self.compare_splitter.addWidget(self.after_image_label)
         self.compare_splitter.setStretchFactor(0, 1)
@@ -943,7 +788,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.process_btn.clicked.connect(self._handle_process)
         self.adjustments_reset_btn.clicked.connect(self._reset_adjustments)
         self.before_image_view.cropChanged.connect(self._handle_manual_crop_rect)
-        self.white_balance_btn.clicked.connect(self._open_white_balance_dialog)
+        self.after_image_label.whiteBalancePickRequested.connect(
+            self._handle_after_white_balance_pick
+        )
 
     def _create_menus(self) -> None:
         menu = self.menuBar().addMenu("")
@@ -1101,16 +948,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._t("status_preview_generated", "Preview generated for {} image(s)." ).format(1)
         )
 
-    def _open_white_balance_dialog(self) -> None:
-        if self.last_after_image is None or self.current_preview_path is None:
-            QtWidgets.QMessageBox.information(
-                self,
-                self._t("white_balance_dialog_title", "White Balance Adjustment"),
-                self._t(
-                    "white_balance_no_preview",
-                    "Generate a preview before adjusting white balance.",
-                ),
-            )
+    def _handle_after_white_balance_pick(self, x: float, y: float) -> None:
+        if self.current_preview_path is None:
             return
         try:
             core_image = self.api.get_preview_core_image(
@@ -1123,24 +962,34 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         if core_image is None or core_image.ndim < 3 or core_image.shape[2] < 3:
-            QtWidgets.QMessageBox.warning(
-                self,
-                self._t("white_balance_dialog_title", "White Balance Adjustment"),
-                self._t(
-                    "white_balance_unavailable",
-                    "White balance sampling is unavailable for this preview.",
-                ),
-            )
             return
-        pixmap = numpy_to_qpixmap(self.last_after_image)
-        dialog = WhiteBalanceDialog(pixmap, core_image, self._t, self)
-        dialog.sampleSelected.connect(self._apply_white_balance_sample)
-        dialog.exec()
-
-    def _apply_white_balance_sample(self, temperature: float, tint: float) -> None:
+        height, width = core_image.shape[:2]
+        if height == 0 or width == 0:
+            return
+        xi = int(np.clip(round(x), 0, width - 1))
+        yi = int(np.clip(round(y), 0, height - 1))
+        radius = 2
+        x0 = max(0, xi - radius)
+        x1 = min(width, xi + radius + 1)
+        y0 = max(0, yi - radius)
+        y1 = min(height, yi + radius + 1)
+        patch = core_image[y0:y1, x0:x1]
+        if patch.size == 0:
+            return
+        rgb = patch.reshape(-1, patch.shape[-1]).mean(axis=0)
+        if rgb.shape[0] < 3:
+            return
+        eps = 1e-6
+        r = float(max(rgb[0], eps))
+        g = float(max(rgb[1], eps))
+        b = float(max(rgb[2], eps))
+        temp_value = 0.5 * float(np.log2(b / r))
+        tint_value = (temp_value - float(np.log2(g / r))) / 1.5
+        temp_value = float(np.clip(temp_value, -2.0, 2.0))
+        tint_value = float(np.clip(tint_value, -2.0, 2.0))
         self._adjustment_sync_in_progress = True
         try:
-            for key, value in {"temperature": temperature, "tint": tint}.items():
+            for key, value in {"temperature": temp_value, "tint": tint_value}.items():
                 slider = self.adjustment_sliders[key]
                 spin = self.adjustment_spinboxes[key]
                 int_value = int(round(value * 100))
@@ -1153,9 +1002,6 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._adjustment_sync_in_progress = False
         self._handle_adjustment_change()
-        self.status_label.setText(
-            self._t("white_balance_applied_status", "White balance updated from sample.")
-        )
 
     def _on_adjustment_slider_changed(self, key: str, value: int) -> None:
         spin = self.adjustment_spinboxes[key]
