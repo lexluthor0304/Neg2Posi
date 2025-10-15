@@ -735,8 +735,6 @@ def _process_loaded_image(
         override_pts=override_pts,
     )
     img_corr = _apply_tone_adjustments(img_corr)
-    if film_type != FILM_TYPE_BW_INTERNAL_KEY:
-        img_corr = _apply_frontier_lut(img_corr)
     return img_corr
 
 
@@ -1105,6 +1103,8 @@ def process_color_pipeline(img: np.ndarray,
     if apply_geometry:
         img = rotate_and_crop_color(img)
     if img.size == 0 or img.shape[0] < 2 or img.shape[1] < 2: return np.zeros((100,100,3), dtype=np.float32) # Handle empty crop
+    if img.ndim == 3 and img.shape[2] >= 3:
+        img = _apply_frontier_lut(img)
     img_inv = 1.0 - img
     black_pts = np.percentile(img_inv, low_pct, axis=(0,1))
     white_pts = np.percentile(img_inv, high_pct, axis=(0,1))
