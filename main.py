@@ -123,10 +123,6 @@ def apply_lensfun_correction(path: str, img: np.ndarray) -> np.ndarray:
     return img_corr
 import logging # Added for consistency, though not heavily used in original GUI feedback
 
-# Path to the bundled LUT used for color grading
-_FRONTIER_LUT_PATH = Path(__file__).resolve().parent / "lut" / "Frontier_like.cube"
-_LUT_CACHE: dict[Path, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -566,123 +562,6 @@ def _apply_tone_adjustments(img: np.ndarray) -> np.ndarray:
     return np.clip(out, 0.0, 1.0)
 
 
-def _load_cube_lut(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Parse and cache a .cube 3D LUT file."""
-
-    cached = _LUT_CACHE.get(path)
-    if cached is not None:
-        return cached
-
-    size: int | None = None
-    domain_min = np.zeros(3, dtype=np.float32)
-    domain_max = np.ones(3, dtype=np.float32)
-    entries: list[list[float]] = []
-
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            for raw_line in handle:
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                tokens = line.split()
-                keyword = tokens[0].upper()
-                if keyword == "TITLE":
-                    continue
-                if keyword == "LUT_3D_SIZE" and len(tokens) >= 2:
-                    size = int(tokens[1])
-                    continue
-                if keyword == "DOMAIN_MIN" and len(tokens) >= 4:
-                    domain_min = np.array(tokens[1:4], dtype=np.float32)
-                    continue
-                if keyword == "DOMAIN_MAX" and len(tokens) >= 4:
-                    domain_max = np.array(tokens[1:4], dtype=np.float32)
-                    continue
-                if len(tokens) >= 3:
-                    entries.append([float(tokens[0]), float(tokens[1]), float(tokens[2])])
-        if size is None:
-            raise ValueError("Missing LUT_3D_SIZE directive")
-        expected = size ** 3
-        if len(entries) != expected:
-            raise ValueError(f"Expected {expected} LUT entries, got {len(entries)}")
-        lut = np.array(entries, dtype=np.float32).reshape((size, size, size, 3))
-    except Exception as exc:  # noqa: BLE001
-        logging.warning(f"Failed to load LUT from {path}: {exc}")
-        raise
-
-    cache_entry = (lut, domain_min.astype(np.float32), domain_max.astype(np.float32))
-    _LUT_CACHE[path] = cache_entry
-    return cache_entry
-
-
-def _apply_3d_lut(
-    img: np.ndarray,
-    lut: np.ndarray,
-    domain_min: np.ndarray,
-    domain_max: np.ndarray,
-) -> np.ndarray:
-    """Apply a 3D LUT to an image using trilinear interpolation."""
-
-    if img.ndim != 3 or img.shape[2] < 3:
-        return img
-
-    size = lut.shape[0]
-    working = img.astype(np.float32, copy=False)
-    dom_min = domain_min.reshape(1, 1, 3)
-    dom_max = domain_max.reshape(1, 1, 3)
-    dom_range = np.maximum(dom_max - dom_min, 1e-6)
-
-    coords = (working[..., :3] - dom_min) / dom_range
-    coords = np.clip(coords, 0.0, 1.0) * (size - 1)
-
-    flat = coords.reshape(-1, 3)
-    idx0 = np.floor(flat).astype(np.int32)
-    frac = flat - idx0
-    idx1 = np.clip(idx0 + 1, 0, size - 1)
-
-    x0, y0, z0 = idx0[:, 0], idx0[:, 1], idx0[:, 2]
-    x1, y1, z1 = idx1[:, 0], idx1[:, 1], idx1[:, 2]
-    dx = frac[:, 0][:, None]
-    dy = frac[:, 1][:, None]
-    dz = frac[:, 2][:, None]
-
-    c000 = lut[x0, y0, z0]
-    c100 = lut[x1, y0, z0]
-    c010 = lut[x0, y1, z0]
-    c110 = lut[x1, y1, z0]
-    c001 = lut[x0, y0, z1]
-    c101 = lut[x1, y0, z1]
-    c011 = lut[x0, y1, z1]
-    c111 = lut[x1, y1, z1]
-
-    one = 1.0
-    out_flat = (
-        c000 * (one - dx) * (one - dy) * (one - dz)
-        + c100 * dx * (one - dy) * (one - dz)
-        + c010 * (one - dx) * dy * (one - dz)
-        + c110 * dx * dy * (one - dz)
-        + c001 * (one - dx) * (one - dy) * dz
-        + c101 * dx * (one - dy) * dz
-        + c011 * (one - dx) * dy * dz
-        + c111 * dx * dy * dz
-    )
-
-    out = out_flat.reshape(img.shape[0], img.shape[1], 3)
-    if img.shape[2] > 3:
-        tail = working[..., 3:]
-        out = np.concatenate([out, tail], axis=2)
-    return np.clip(out, 0.0, 1.0)
-
-
-def _apply_frontier_lut(img: np.ndarray) -> np.ndarray:
-    """Apply the bundled Frontier-like LUT, returning *img* on failure."""
-
-    try:
-        lut, domain_min, domain_max = _load_cube_lut(_FRONTIER_LUT_PATH)
-    except Exception:  # noqa: BLE001
-        return img
-    return _apply_3d_lut(img, lut, domain_min, domain_max)
-
-
 def _process_loaded_image_core(
     img_original: np.ndarray,
     in_path: str,
@@ -734,8 +613,7 @@ def _process_loaded_image(
         high_pct,
         override_pts=override_pts,
     )
-    img_corr = _apply_tone_adjustments(img_corr)
-    return img_corr
+    return _apply_tone_adjustments(img_corr)
 
 
 def order_points(pts):
@@ -1103,8 +981,6 @@ def process_color_pipeline(img: np.ndarray,
     if apply_geometry:
         img = rotate_and_crop_color(img)
     if img.size == 0 or img.shape[0] < 2 or img.shape[1] < 2: return np.zeros((100,100,3), dtype=np.float32) # Handle empty crop
-    if img.ndim == 3 and img.shape[2] >= 3:
-        img = _apply_frontier_lut(img)
     img_inv = 1.0 - img
     black_pts = np.percentile(img_inv, low_pct, axis=(0,1))
     white_pts = np.percentile(img_inv, high_pct, axis=(0,1))
